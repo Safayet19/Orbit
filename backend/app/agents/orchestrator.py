@@ -3,9 +3,10 @@ import time
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app.collectors.base import Collector, RecordNormalizationError
@@ -20,6 +21,14 @@ LOGGER = logging.getLogger(__name__)
 class CollectionRunError(RuntimeError):
     """Raised when collection cannot complete; message contains no source secrets."""
 
+    def __init__(
+        self,
+        message: str,
+        failure_category: str = "worker_execution_error",
+    ) -> None:
+        self.failure_category = failure_category
+        super().__init__(message)
+
 
 @dataclass(frozen=True)
 class CollectionSummary:
@@ -32,6 +41,8 @@ class CollectionSummary:
     records_unchanged: int
     records_invalid: int
     duration_seconds: float
+    quality_status: str = "unknown"
+    quality_details: dict[str, Any] | None = None
 
 
 def _validation_details(error: ValidationError) -> list[dict[str, str]]:
@@ -68,9 +79,10 @@ class CollectionOrchestrator:
         source_id: str,
         collector: Collector,
         run_id: uuid.UUID | None = None,
+        before_persist: Callable[[Session], None] | None = None,
     ) -> CollectionSummary:
         try:
-            return self._run(source_id, collector, run_id)
+            return self._run(source_id, collector, run_id, before_persist)
         finally:
             collector.close()
 
@@ -79,6 +91,7 @@ class CollectionOrchestrator:
         source_id: str,
         collector: Collector,
         requested_run_id: uuid.UUID | None,
+        before_persist: Callable[[Session], None] | None,
     ) -> CollectionSummary:
         if source_id != collector.source_id:
             raise CollectionRunError("Requested source does not match its collector.")
@@ -111,8 +124,16 @@ class CollectionOrchestrator:
                 source_id,
                 type(error).__name__,
             )
+            category = (
+                "database_failure"
+                if isinstance(error, SQLAlchemyError)
+                else "scheduling_configuration"
+                if isinstance(error, CollectionRunError)
+                else "worker_execution_error"
+            )
             raise CollectionRunError(
-                f"Collection could not start ({type(error).__name__})."
+                f"Collection could not start ({type(error).__name__}).",
+                category,
             ) from None
 
         LOGGER.info("collection_started source=%s run_id=%s", source_id, run_id)
@@ -151,14 +172,38 @@ class CollectionOrchestrator:
 
             completed_at = utc_now()
             with self._session_factory.begin() as session:
+                if before_persist is not None:
+                    before_persist(session)
+                valid_ratio = (
+                    len(valid_records) / fetched_count if fetched_count else 1.0
+                )
+                quality_status = (
+                    "degraded"
+                    if fetched_count > 0 and valid_ratio < 0.8
+                    else "healthy"
+                )
+                quality_details = {
+                    "records_fetched": fetched_count,
+                    "records_valid": len(valid_records),
+                    "records_invalid": len(invalid_records),
+                    "valid_ratio": round(valid_ratio, 4),
+                    "accepted_records_persisted": (
+                        len(valid_records) if quality_status == "healthy" else 0
+                    ),
+                    "threshold": 0.8,
+                }
                 counts = repositories.persist_success(
                     session=session,
                     run_id=run_id,
                     source=source_snapshot,
-                    records=valid_records,
+                    records=(
+                        valid_records if quality_status == "healthy" else []
+                    ),
                     invalid_records=invalid_records,
                     records_fetched=fetched_count,
                     completed_at=completed_at,
+                    quality_status=quality_status,
+                    quality_details=quality_details,
                 )
         except Exception as error:
             failure_summary = _safe_error_summary(error)
@@ -186,7 +231,14 @@ class CollectionOrchestrator:
             )
             if isinstance(error, CollectionRunError):
                 raise
-            raise CollectionRunError(failure_summary) from None
+            failure_category = getattr(error, "category", None)
+            if not isinstance(failure_category, str):
+                failure_category = (
+                    "database_failure"
+                    if isinstance(error, SQLAlchemyError)
+                    else "worker_execution_error"
+                )
+            raise CollectionRunError(failure_summary, failure_category) from None
         duration = time.monotonic() - started_clock
         summary = CollectionSummary(
             run_id=run_id,
@@ -198,6 +250,8 @@ class CollectionOrchestrator:
             records_unchanged=counts["unchanged"],
             records_invalid=len(invalid_records),
             duration_seconds=duration,
+            quality_status=quality_status,
+            quality_details=quality_details,
         )
         LOGGER.info(
             "collection_completed source=%s run_id=%s status=%s fetched=%d "

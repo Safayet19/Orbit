@@ -168,6 +168,8 @@ def persist_success(
     invalid_records: Sequence[tuple[str | None, list[dict[str, str]]]],
     records_fetched: int,
     completed_at: datetime,
+    quality_status: str = "healthy",
+    quality_details: dict[str, Any] | None = None,
 ) -> dict[str, int]:
     counts = {"new": 0, "changed": 0, "unchanged": 0}
     external_ids = {str(getattr(record, "external_record_id")) for record in records}
@@ -214,6 +216,8 @@ def persist_success(
     run.records_changed = counts["changed"]
     run.records_unchanged = counts["unchanged"]
     run.records_invalid = len(invalid_records)
+    run.quality_status = quality_status
+    run.quality_details = quality_details or {}
     return counts
 
 
@@ -229,3 +233,4 @@ def mark_run_failed(
     run.status = "failed"
     run.completed_at = completed_at
     run.error_summary = error_summary[:300]
+    run.quality_status = "failed"

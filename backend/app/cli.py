@@ -1,6 +1,7 @@
 import argparse
 import getpass
 import logging
+import signal
 import sys
 
 from alembic import command
@@ -8,7 +9,7 @@ from alembic.config import Config
 from pwdlib import PasswordHash
 
 from backend.app.agents.orchestrator import CollectionOrchestrator
-from backend.app.collectors.worldbank import WorldBankInflationCollector
+from backend.app.collectors.worldbank import create_world_bank_collector
 from backend.app.core.config import PROJECT_ROOT
 from backend.app.core.logging import configure_logging
 from backend.app.db.session import (
@@ -17,6 +18,7 @@ from backend.app.db.session import (
     verify_database,
 )
 from backend.app.schemas.records import WORLD_BANK_SOURCE_ID
+from backend.app.workers.agent_worker import AgentWorker
 
 LOGGER = logging.getLogger(__name__)
 
@@ -27,6 +29,12 @@ def _parser() -> argparse.ArgumentParser:
 
     collect = subparsers.add_parser("collect", help="Run a registered source collector.")
     collect.add_argument("--source", required=True)
+    agent = subparsers.add_parser(
+        "agent",
+        help="Run the independent autonomous collection worker.",
+    )
+    agent.add_argument("action", nargs="?", choices=("start",), default="start")
+    agent.add_argument("--once", action="store_true")
     subparsers.add_parser("migrate", help="Apply pending database migrations.")
     subparsers.add_parser(
         "hash-password",
@@ -63,15 +71,31 @@ def main(argv: list[str] | None = None) -> int:
             print(PasswordHash.recommended().hash(first))
             return 0
 
-        if args.source != WORLD_BANK_SOURCE_ID:
-            raise ValueError("Source is not registered.")
-
         engine = create_database_engine()
         verify_database(engine)
-        orchestrator = CollectionOrchestrator(create_session_factory(engine))
+        factory = create_session_factory(engine)
+        if args.command == "agent":
+            worker = AgentWorker(factory)
+
+            def request_shutdown(_signum: int, _frame: object) -> None:
+                worker.stop()
+
+            signal.signal(signal.SIGINT, request_shutdown)
+            if hasattr(signal, "SIGTERM"):
+                signal.signal(signal.SIGTERM, request_shutdown)
+            return worker.start(once=args.once)
+
+        supported_sources = {
+            WORLD_BANK_SOURCE_ID,
+            "worldbank-bd-gdp-growth",
+            "worldbank-bd-population",
+        }
+        if args.source not in supported_sources:
+            raise ValueError("Source is not registered.")
+        orchestrator = CollectionOrchestrator(factory)
         summary = orchestrator.run(
             args.source,
-            WorldBankInflationCollector(),
+            create_world_bank_collector(args.source),
         )
         print(
             f"Collection {summary.status}: source={summary.source_id} "
@@ -79,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
             f"changed={summary.records_changed} "
             f"unchanged={summary.records_unchanged} "
             f"invalid={summary.records_invalid} "
+            f"quality={summary.quality_status} "
             f"duration={summary.duration_seconds:.2f}s"
         )
         return 0

@@ -4,35 +4,20 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session, sessionmaker
 
-from backend.app.agents.orchestrator import CollectionOrchestrator
 from backend.app.api.auth import get_admin_session, require_csrf
 from backend.app.api.dependencies import get_session
 from backend.app.api.schemas import CollectionRequest, PageMetadata
 from backend.app.api.services.admin_reads import get_run, list_runs
 from backend.app.api.services.admin_writes import AdminOperationError, create_collection_run
-from backend.app.collectors.worldbank import WorldBankInflationCollector
 from backend.app.core.admin_config import AdminConfig, get_admin_config
 from backend.app.db.models import AdminSession
+from backend.app.workers.agent_worker import JobLease, execute_owned_job
 
 router = APIRouter(
     prefix="/collections",
     tags=["collections"],
     dependencies=[Depends(get_admin_session)],
 )
-
-
-def execute_collection(
-    factory: sessionmaker[Session],
-    run_id: uuid.UUID,
-    source_key: str,
-) -> None:
-    if source_key != WorldBankInflationCollector.source_id:
-        return
-    CollectionOrchestrator(factory).run(
-        source_key,
-        WorldBankInflationCollector(),
-        run_id=run_id,
-    )
 
 
 @router.post("", status_code=status.HTTP_202_ACCEPTED)
@@ -52,11 +37,19 @@ def start_collection(
         config,
     )
     try:
-        run = create_collection_run(session, source_key)
+        run, job = create_collection_run(session, source_key)
         run_id = run.id
+        lease = JobLease(
+            job_id=job.id,
+            run_id=run.id,
+            source_id=job.source_id,
+            source_key=source_key,
+            worker_id=job.worker_id or "",
+            generation=job.lease_generation,
+        )
         session.commit()
         factory: sessionmaker[Session] = request.app.state.session_factory
-        background_tasks.add_task(execute_collection, factory, run_id, source_key)
+        background_tasks.add_task(execute_owned_job, factory, lease)
     except AdminOperationError as error:
         raise HTTPException(status_code=409, detail=str(error)) from None
     except Exception:

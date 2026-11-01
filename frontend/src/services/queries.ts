@@ -1,6 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
 import { api } from "./api";
 import type {
+  AgentDecisionItem,
+  AgentJobItem,
+  AgentSchedule,
+  AgentStatus,
   CollectionRun,
   HistoryItem,
   Overview,
@@ -110,5 +114,43 @@ export function useSystemInfo() {
   return useQuery({
     queryKey: ["system"],
     queryFn: () => api<SystemInfo>("/api/admin/system"),
+  });
+}
+
+export function useAgentStatus() {
+  return useQuery({
+    queryKey: ["agent-status"],
+    queryFn: () => api<AgentStatus>("/api/admin/agent/status"),
+    refetchInterval: 20_000,
+  });
+}
+
+export function useAgentSchedules() {
+  return useQuery({
+    queryKey: ["agent-schedules"],
+    queryFn: () =>
+      api<{ items: AgentSchedule[]; total: number }>("/api/admin/agent/schedules"),
+    refetchInterval: 30_000,
+  });
+}
+
+export function useAgentJobs(page = 1, sourceId?: string, state?: string) {
+  const params = new URLSearchParams({ page: String(page), page_size: "20" });
+  if (sourceId) params.set("source_id", sourceId);
+  if (state) params.set("state", state);
+  return useQuery({
+    queryKey: ["agent-jobs", page, sourceId, state],
+    queryFn: () => api<Page<AgentJobItem>>(`/api/admin/agent/jobs?${params}`),
+    refetchInterval: 10_000,
+  });
+}
+
+export function useAgentDecisions(page = 1, sourceId?: string) {
+  const params = new URLSearchParams({ page: String(page), page_size: "20" });
+  if (sourceId) params.set("source_id", sourceId);
+  return useQuery({
+    queryKey: ["agent-decisions", page, sourceId],
+    queryFn: () => api<Page<AgentDecisionItem>>(`/api/admin/agent/decisions?${params}`),
+    refetchInterval: 30_000,
   });
 }

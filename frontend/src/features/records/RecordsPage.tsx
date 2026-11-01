@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Download, ExternalLink, Search } from "lucide-react";
 import { Link } from "react-router-dom";
-import { Button, EmptyState, ErrorState, formatDateTime, LoadingState, PageHeader, Pagination, Panel, StatusBadge } from "../../components/ui/Primitives";
+import { Button, EmptyState, ErrorState, formatDateTime, LoadingState, PageHeader, Pagination, Panel } from "../../components/ui/Primitives";
 import { useToast } from "../../components/ui/Toast";
 import { downloadCsv } from "../../services/api";
 import { useRecords, useSources } from "../../services/queries";
@@ -43,6 +43,19 @@ export default function RecordsPage() {
     return params;
   }, [page, pageSize, sortOrder, debouncedSearch, sourceId, category, after, before]);
   const { data, isLoading, isError, error, refetch } = useRecords(query);
+  const selectedSource = sources.data?.items.find(
+    (source) => source.source_key === sourceId,
+  );
+  const observationLabel =
+    selectedSource?.source_key === "worldbank-bd-inflation"
+      ? "Inflation Rate (%)"
+      : selectedSource?.source_key === "worldbank-bd-gdp-growth"
+        ? "GDP Growth (%)"
+        : selectedSource?.source_key === "worldbank-bd-population"
+          ? "Population"
+          : selectedSource
+            ? "Value"
+            : "Observation";
 
   async function exportData() {
     setExporting(true);
@@ -67,7 +80,11 @@ export default function RecordsPage() {
     <>
       <PageHeader
         title="Data explorer"
-        description="Search, filter, and inspect persisted collection records."
+        description={
+          selectedSource
+            ? `Search and inspect ${selectedSource.name} observations.`
+            : "Search, filter, and inspect persisted collection records."
+        }
         action={<Button variant="secondary" disabled={exporting || !data?.pagination.total} onClick={() => void exportData()}><Download size={15} /> {exporting ? "Exporting…" : "Export CSV"}</Button>}
       />
       <Panel>
@@ -81,7 +98,7 @@ export default function RecordsPage() {
           </select>
           <label className="date-filter">Observed after<input className="control" type="date" value={after} onChange={(event) => { setAfter(event.target.value); setPage(1); }} /></label>
           <label className="date-filter">Observed before<input className="control" type="date" value={before} onChange={(event) => { setBefore(event.target.value); setPage(1); }} /></label>
-          <button className="button button-quiet" onClick={() => { setSortOrder(sortOrder === "desc" ? "asc" : "desc"); setPage(1); }}>Last observed {sortOrder === "desc" ? "↓" : "↑"}</button>
+          <button className="button button-quiet" onClick={() => { setSortOrder(sortOrder === "desc" ? "asc" : "desc"); setPage(1); }}>Sort by Last Updated {sortOrder === "desc" ? "↓" : "↑"}</button>
         </div>
         {isLoading ? <LoadingState /> : isError || !data ? (
           <ErrorState message={error instanceof Error ? error.message : "Records are unavailable."} retry={() => void refetch()} />
@@ -89,16 +106,21 @@ export default function RecordsPage() {
           <>
             <div className="table-wrap">
               <table className="data-table record-table">
-                <thead><tr><th>External identity</th><th>Source</th><th>Category</th><th>Observation</th><th>Last observed</th><th>Version</th><th>Status</th></tr></thead>
+                <thead><tr><th>Year</th><th>{observationLabel}</th><th>Source</th><th>Last Updated</th><th>Version</th><th>Details</th></tr></thead>
                 <tbody>{data.items.map((record) => (
                   <tr key={record.id}>
-                    <td><Link className="text-link mono record-id-link" title={record.external_record_id} to={`/records/${record.id}`}>{record.external_record_id}</Link><span className="table-secondary">Record {record.id.slice(0, 8)}</span></td>
+                    <td className="record-year">{record.data.year == null ? "—" : String(record.data.year)}</td>
+                    <td className="record-value">
+                      {sourceId === "worldbank-bd-inflation"
+                        ? formatInflation(record.data.value)
+                        : record.data.value == null
+                          ? "—"
+                          : String(record.data.value)}
+                    </td>
                     <td>{record.source_name}</td>
-                    <td>{record.category.replaceAll("_", " ")}</td>
-                    <td>{Object.entries(record.data).slice(0, 3).map(([key, value]) => <span className="record-field" key={key}><b>{key}:</b> {String(value)}</span>)}</td>
                     <td>{formatDateTime(record.last_observed_at)}</td>
                     <td className="mono">v{record.version_number}</td>
-                    <td><StatusBadge status={record.status} /></td>
+                    <td><Link className="text-link record-details-link" to={`/records/${record.id}`}>View details</Link></td>
                   </tr>
                 ))}</tbody>
               </table>
@@ -113,4 +135,9 @@ export default function RecordsPage() {
       </Panel>
     </>
   );
+}
+
+function formatInflation(value: unknown): string {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? `${numericValue.toFixed(2)}%` : "—";
 }

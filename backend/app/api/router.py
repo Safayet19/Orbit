@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 
+from backend.app.api.routes.agent import router as agent_router
 from backend.app.api.auth import router as auth_router
 from backend.app.api.routes.collections import router as collections_router
 from backend.app.api.routes.overview import router as overview_router
@@ -11,6 +12,7 @@ from backend.app.api.routes.system import router as system_router
 router = APIRouter()
 router.include_router(auth_router)
 admin_router = APIRouter(prefix="/api/admin")
+admin_router.include_router(agent_router)
 admin_router.include_router(overview_router)
 admin_router.include_router(sources_router)
 admin_router.include_router(collections_router)

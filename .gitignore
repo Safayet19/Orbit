@@ -31,3 +31,23 @@ logs/
 
 # Frontend build output
 /frontend/dist/
+
+# Python packaging
+*.egg-info/
+build/
+dist/
+
+# Test coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage/
+
+# IDE and OS files
+.idea/
+.DS_Store
+Thumbs.db
+
+# Private keys and certificates
+*.pem
+*.key

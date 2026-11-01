@@ -16,6 +16,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -74,6 +75,10 @@ class CollectionRun(Base):
             "AND records_unchanged >= 0 AND records_invalid >= 0",
             name="ck_orbit_collection_runs_nonnegative_counts",
         ),
+        CheckConstraint(
+            "quality_status IN ('healthy', 'degraded', 'failed', 'unknown')",
+            name="ck_orbit_collection_runs_quality_status",
+        ),
         Index("ix_orbit_collection_runs_source_started", "source_id", "started_at"),
         Index("ix_orbit_collection_runs_status_started", "status", "started_at"),
     )
@@ -95,6 +100,12 @@ class CollectionRun(Base):
     records_unchanged: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     records_invalid: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_summary: Mapped[str | None] = mapped_column(String(300))
+    quality_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="unknown", server_default="unknown"
+    )
+    quality_details: Mapped[dict[str, Any]] = mapped_column(
+        JSON_DOCUMENT, nullable=False, default=dict, server_default="{}"
+    )
 
 
 class CurrentRecord(Base):
@@ -183,3 +194,177 @@ class AdminSession(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SourceSchedule(Base):
+    __tablename__ = "orbit_source_schedules"
+    __table_args__ = (
+        CheckConstraint(
+            "mode IN ('fixed', 'adaptive', 'paused')",
+            name="ck_orbit_source_schedules_mode",
+        ),
+        CheckConstraint(
+            "base_interval_seconds BETWEEN 3600 AND 7776000",
+            name="ck_orbit_source_schedules_base_interval",
+        ),
+        CheckConstraint(
+            "minimum_interval_seconds BETWEEN 60 AND 7776000",
+            name="ck_orbit_source_schedules_min_interval",
+        ),
+        CheckConstraint(
+            "maximum_interval_seconds BETWEEN 3600 AND 31536000",
+            name="ck_orbit_source_schedules_max_interval",
+        ),
+        CheckConstraint(
+            "minimum_interval_seconds <= base_interval_seconds "
+            "AND base_interval_seconds <= maximum_interval_seconds",
+            name="ck_orbit_source_schedules_interval_order",
+        ),
+        CheckConstraint(
+            "priority BETWEEN 1 AND 10",
+            name="ck_orbit_source_schedules_priority",
+        ),
+        Index("ix_orbit_source_schedules_due", "enabled", "mode", "next_due_at"),
+    )
+
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("orbit_sources.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="adaptive", server_default="adaptive"
+    )
+    enabled: Mapped[bool] = mapped_column(nullable=False, default=True, server_default="true")
+    base_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    minimum_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    maximum_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    maximum_retries: Mapped[int] = mapped_column(Integer, nullable=False, default=5, server_default="5")
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=5, server_default="5")
+    next_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_attempted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_successful_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    consecutive_unchanged: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    health_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="unknown", server_default="unknown"
+    )
+    health_reason: Mapped[str | None] = mapped_column(String(300))
+    quality_ratio: Mapped[float | None] = mapped_column()
+    last_decision: Mapped[str | None] = mapped_column(String(40))
+    policy_metadata: Mapped[dict[str, Any]] = mapped_column(
+        JSON_DOCUMENT, nullable=False, default=dict, server_default="{}"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=utc_now
+    )
+
+
+class AgentWorker(Base):
+    __tablename__ = "orbit_agent_workers"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('starting', 'idle', 'executing', 'stopping', 'unhealthy', 'offline')",
+            name="ck_orbit_agent_workers_status",
+        ),
+        Index("ix_orbit_agent_workers_heartbeat", "last_heartbeat_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(120), primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    last_heartbeat_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="starting", server_default="starting"
+    )
+    active_job_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True))
+    last_error: Mapped[str | None] = mapped_column(String(300))
+    version: Mapped[str] = mapped_column(String(40), nullable=False, default="0.1.0")
+
+
+class AgentJob(Base):
+    __tablename__ = "orbit_agent_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "trigger_type IN ('manual', 'scheduled')",
+            name="ck_orbit_agent_jobs_trigger",
+        ),
+        CheckConstraint(
+            "status IN ('queued', 'running', 'retry_wait', 'completed', 'failed', 'cancelled')",
+            name="ck_orbit_agent_jobs_status",
+        ),
+        Index("ix_orbit_agent_jobs_claim", "status", "scheduled_at", "created_at"),
+        Index("ix_orbit_agent_jobs_source_created", "source_id", "created_at"),
+        Index(
+            "uq_orbit_agent_jobs_active_source",
+            "source_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running', 'retry_wait')"),
+            sqlite_where=text("status IN ('queued', 'running', 'retry_wait')"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("orbit_sources.id", ondelete="RESTRICT"), nullable=False
+    )
+    trigger_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    scheduled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="queued", server_default="queued"
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    worker_id: Mapped[str | None] = mapped_column(String(120))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    collection_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("orbit_collection_runs.id", ondelete="SET NULL")
+    )
+    failure_category: Mapped[str | None] = mapped_column(String(40))
+    error_summary: Mapped[str | None] = mapped_column(String(300))
+    quality_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="unknown", server_default="unknown"
+    )
+
+
+class AgentDecision(Base):
+    __tablename__ = "orbit_agent_decisions"
+    __table_args__ = (
+        Index("ix_orbit_agent_decisions_created", "created_at"),
+        Index("ix_orbit_agent_decisions_source_created", "source_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    source_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("orbit_sources.id", ondelete="SET NULL")
+    )
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("orbit_agent_jobs.id", ondelete="SET NULL")
+    )
+    decision_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(60), nullable=False)
+    explanation: Mapped[str] = mapped_column(String(500), nullable=False)
+    context: Mapped[dict[str, Any]] = mapped_column(
+        JSON_DOCUMENT, nullable=False, default=dict, server_default="{}"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    next_action_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    policy_version: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="1", server_default="1"
+    )

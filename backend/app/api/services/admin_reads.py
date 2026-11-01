@@ -14,7 +14,7 @@ from backend.app.api.schemas import (
     RunSummary,
     SourceSummary,
 )
-from backend.app.collectors.worldbank import WorldBankInflationCollector
+from backend.app.collectors.worldbank import INDICATOR_SPECS
 from backend.app.db.models import (
     CollectionRun,
     CurrentRecord,
@@ -23,7 +23,7 @@ from backend.app.db.models import (
     Source,
 )
 
-SUPPORTED_SOURCE_IDS = frozenset({WorldBankInflationCollector.source_id})
+SUPPORTED_SOURCE_IDS = frozenset(spec.source_id for spec in INDICATOR_SPECS)
 
 
 def _run_summary(run: CollectionRun, source_name: str, now: datetime) -> RunSummary:
@@ -43,6 +43,7 @@ def _run_summary(run: CollectionRun, source_name: str, now: datetime) -> RunSumm
         records_unchanged=run.records_unchanged,
         records_invalid=run.records_invalid,
         error_summary=run.error_summary,
+        quality_status=run.quality_status,
     )
 
 

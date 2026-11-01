@@ -37,6 +37,7 @@ export interface CollectionRun {
   records_unchanged: number;
   records_invalid: number;
   error_summary: string | null;
+  quality_status: AgentHealth;
 }
 
 export interface RecordItem {
@@ -134,4 +135,116 @@ export interface SystemInfo {
   };
   collectors: { source_id: string; name: string; category: string }[];
   scheduling: { configured: boolean; status: string };
+}
+
+export type AgentHealth = "healthy" | "degraded" | "failed" | "paused" | "unknown";
+
+export interface AgentWorker {
+  worker_id: string;
+  status: "starting" | "idle" | "executing" | "stopping" | "unhealthy" | "offline";
+  started_at: string;
+  last_heartbeat_at: string;
+  active_job_id: string | null;
+  last_error: string | null;
+  version: string;
+}
+
+export interface AgentStatus {
+  checked_at: string;
+  worker_online: boolean;
+  workers: AgentWorker[];
+  active_jobs: number;
+  scheduled_jobs: number;
+  scheduled_sources: number;
+  next_execution_at: string | null;
+  healthy_sources: number;
+  degraded_sources: number;
+  latest_success: {
+    run_id: string;
+    source_name: string;
+    status: string;
+    started_at: string;
+    completed_at: string | null;
+    quality_status: AgentHealth;
+    error_summary: string | null;
+  } | null;
+  latest_failure: {
+    run_id: string;
+    source_name: string;
+    status: string;
+    started_at: string;
+    completed_at: string | null;
+    quality_status: AgentHealth;
+    error_summary: string | null;
+  } | null;
+  successful_jobs: number;
+  failed_jobs: number;
+  average_duration_seconds: number | null;
+  average_duration_sample_size: number;
+  retry_count: number;
+  worker_offline_after_seconds: number;
+}
+
+export interface AgentSchedule {
+  source_id: string;
+  source_name: string;
+  approved: boolean;
+  source_enabled: boolean;
+  mode: "fixed" | "adaptive" | "paused";
+  enabled: boolean;
+  base_interval_seconds: number;
+  minimum_interval_seconds: number;
+  maximum_interval_seconds: number;
+  priority: number;
+  next_due_at: string | null;
+  last_attempted_at: string | null;
+  last_successful_at: string | null;
+  consecutive_failures: number;
+  consecutive_unchanged: number;
+  health_status: AgentHealth;
+  health_reason: string | null;
+  quality_ratio: number | null;
+  latest_run: {
+    run_id: string;
+    status: string;
+    started_at: string;
+    completed_at: string | null;
+    quality_status: AgentHealth;
+    records_fetched: number;
+    records_invalid: number;
+    error_summary: string | null;
+  } | null;
+}
+
+export interface AgentDecisionItem {
+  decision_id: string;
+  source_name: string;
+  source_id: string | null;
+  job_id: string | null;
+  decision_type: string;
+  reason_code: string;
+  explanation: string;
+  context: Record<string, unknown>;
+  created_at: string;
+  next_action_at: string | null;
+}
+
+export interface AgentJobItem {
+  job_id: string;
+  source_id: string;
+  source_name: string;
+  trigger_type: "manual" | "scheduled";
+  created_at: string;
+  scheduled_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  status: "queued" | "running" | "retry_wait" | "completed" | "failed" | "cancelled";
+  attempt_count: number;
+  worker_id: string | null;
+  lease_expires_at: string | null;
+  lease_generation: number;
+  collection_run_id: string | null;
+  failure_category: string | null;
+  error_summary: string | null;
+  quality_status: AgentHealth;
 }

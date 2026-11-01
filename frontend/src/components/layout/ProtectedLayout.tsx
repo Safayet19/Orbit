@@ -27,7 +27,7 @@ const navigation = [
     title: "Collection",
     items: [
       { label: "Data sources", path: "/sources", icon: Boxes },
-      { label: "Agent operations", path: "/operations", icon: Activity },
+      { label: "Agent Control Center", path: "/operations", icon: Activity },
       { label: "Data explorer", path: "/records", icon: Database },
       { label: "History & changes", path: "/history", icon: History },
     ],
@@ -44,7 +44,7 @@ const navigation = [
 const titles: Record<string, string> = {
   "/": "Overview",
   "/sources": "Data sources",
-  "/operations": "Agent operations",
+  "/operations": "Agent Control Center",
   "/records": "Data explorer",
   "/history": "History & changes",
   "/quality": "Data quality",

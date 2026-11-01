@@ -23,6 +23,17 @@ class SourceEnabledRequest(BaseModel):
     enabled: bool
 
 
+class AgentScheduleUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["fixed", "adaptive", "paused"] | None = None
+    enabled: bool | None = None
+    base_interval_seconds: int | None = Field(default=None, ge=3600, le=7_776_000)
+    minimum_interval_seconds: int | None = Field(default=None, ge=60, le=7_776_000)
+    maximum_interval_seconds: int | None = Field(default=None, ge=3600, le=31_536_000)
+    priority: int | None = Field(default=None, ge=1, le=10)
+
+
 class AuthenticatedUser(BaseModel):
     username: str
     csrf_token: str
@@ -64,6 +75,7 @@ class RunSummary(BaseModel):
     records_unchanged: int
     records_invalid: int
     error_summary: str | None
+    quality_status: str = "unknown"
 
 
 class RecordSummary(BaseModel):

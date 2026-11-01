@@ -20,6 +20,7 @@ export default function RecordDetailPage() {
         <Cell label="Source">{item.source_name}</Cell>
         <Cell label="Category">{item.category.replaceAll("_", " ")}</Cell>
         <Cell label="Status">{item.status}</Cell>
+        <Cell label="Record ID"><span className="mono">{item.id}</span></Cell>
         <Cell label="Record identifier"><span className="mono">{item.external_record_id}</span></Cell>
         <Cell label="First observed">{formatDateTime(item.first_observed_at)}</Cell>
         <Cell label="Last observed">{formatDateTime(item.last_observed_at)}</Cell>
