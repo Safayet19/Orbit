@@ -1,0 +1,21 @@
+:root {
+  color-scheme: dark;
+  --orbit-bg: #0b1017;
+  --orbit-sidebar: #101720;
+  --orbit-surface: #171f2a;
+  --orbit-elevated: #283341;
+  --orbit-border: #354052;
+  --orbit-strong: #526176;
+  --orbit-white: #ffffff;
+  --orbit-regular: #e2e8f0;
+  --orbit-secondary: #d4deea;
+  --orbit-muted: #bfcBDD;
+  --orbit-copper: #ffad73;
+  --orbit-blue: #69baff;
+  --orbit-green: #47d7a5;
+  --orbit-red: #ff7185;
+  --orbit-amber: #ffc46b;
+  font-family: "Inter", system-ui, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
