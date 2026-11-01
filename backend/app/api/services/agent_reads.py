@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from backend.app.collectors.worldbank import INDICATORS_BY_SOURCE
@@ -23,77 +23,82 @@ def _utc(value: datetime) -> datetime:
 
 def get_agent_status(session: Session, now: datetime | None = None) -> dict[str, Any]:
     checked_at = now or datetime.now(timezone.utc)
-    workers = session.scalars(
-        select(AgentWorker).order_by(AgentWorker.last_heartbeat_at.desc())
-    ).all()
-    worker_items = [
-        {
-            "worker_id": worker.id,
-            "status": (
-                worker.status
-                if worker.status != "offline"
-                and _utc(worker.last_heartbeat_at)
-                >= checked_at - timedelta(seconds=WORKER_ONLINE_SECONDS)
-                else "offline"
-            ),
-            "started_at": worker.started_at,
-            "last_heartbeat_at": worker.last_heartbeat_at,
-            "active_job_id": (
-                str(worker.active_job_id) if worker.active_job_id else None
-            ),
-            "last_error": worker.last_error,
-            "version": worker.version,
-        }
-        for worker in workers
-    ]
+    worker_items = _worker_items(session, checked_at)
     online_workers = [worker for worker in worker_items if worker["status"] != "offline"]
-    active_jobs = int(
-        session.scalar(
-            select(func.count(AgentJob.id)).where(AgentJob.status == "running")
-        )
-        or 0
+    scheduled_predicate = (
+        SourceSchedule.enabled.is_(True)
+        & (SourceSchedule.mode != "paused")
+        & SourceSchedule.next_due_at.is_not(None)
     )
-    pending_jobs = int(
-        session.scalar(
-            select(func.count(AgentJob.id)).where(
-                AgentJob.status.in_(("queued", "retry_wait")),
-            )
+    schedule_counts = session.execute(
+        select(
+            func.coalesce(func.sum(case((scheduled_predicate, 1), else_=0)), 0),
+            func.min(
+                case(
+                    (scheduled_predicate, SourceSchedule.next_due_at),
+                    else_=None,
+                )
+            ),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            Source.enabled.is_(True)
+                            & SourceSchedule.enabled.is_(True)
+                            & (SourceSchedule.health_status == "healthy"),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            Source.enabled.is_(True)
+                            & SourceSchedule.enabled.is_(True)
+                            & (SourceSchedule.health_status == "degraded"),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ),
         )
-        or 0
-    )
-    scheduled_sources = int(
-        session.scalar(
-            select(func.count(SourceSchedule.source_id)).where(
-                SourceSchedule.enabled.is_(True),
-                SourceSchedule.mode != "paused",
-                SourceSchedule.next_due_at.is_not(None),
-            )
+        .select_from(SourceSchedule)
+        .join(Source, Source.id == SourceSchedule.source_id)
+    ).one()
+    scheduled_sources = int(schedule_counts[0])
+    next_schedule_execution = schedule_counts[1]
+    healthy_sources = int(schedule_counts[2])
+    degraded_sources = int(schedule_counts[3])
+    pending_predicate = AgentJob.status.in_(("queued", "retry_wait"))
+    job_counts = session.execute(
+        select(
+            func.coalesce(
+                func.sum(case((AgentJob.status == "running", 1), else_=0)),
+                0,
+            ),
+            func.coalesce(func.sum(case((pending_predicate, 1), else_=0)), 0),
+            func.min(case((pending_predicate, AgentJob.scheduled_at), else_=None)),
+            func.coalesce(
+                func.sum(case((AgentJob.attempt_count > 1, 1), else_=0)),
+                0,
+            ),
         )
-        or 0
-    )
-    next_schedule_execution = session.scalar(
-        select(func.min(SourceSchedule.next_due_at)).where(
-            SourceSchedule.enabled.is_(True),
-            SourceSchedule.mode != "paused",
-            SourceSchedule.next_due_at.is_not(None),
-        )
-    )
-    next_job_execution = session.scalar(
-        select(func.min(AgentJob.scheduled_at)).where(
-            AgentJob.status.in_(("queued", "retry_wait"))
-        )
-    )
+    ).one()
+    active_jobs = int(job_counts[0])
+    pending_jobs = int(job_counts[1])
+    next_job_execution = job_counts[2]
+    retry_count = int(job_counts[3])
     next_execution = min(
         (value for value in (next_schedule_execution, next_job_execution) if value is not None),
         key=_utc,
         default=None,
     )
-    enabled_schedules = session.scalars(
-        select(SourceSchedule).join(Source, Source.id == SourceSchedule.source_id)
-        .where(Source.enabled.is_(True), SourceSchedule.enabled.is_(True))
-    ).all()
-    healthy_sources = sum(1 for item in enabled_schedules if item.health_status == "healthy")
-    degraded_sources = sum(1 for item in enabled_schedules if item.health_status == "degraded")
 
     latest_success = session.execute(
         select(CollectionRun, Source.name)
@@ -109,21 +114,22 @@ def get_agent_status(session: Session, now: datetime | None = None) -> dict[str,
         .order_by(CollectionRun.started_at.desc())
         .limit(1)
     ).first()
-    successful_count = int(
-        session.scalar(
-            select(func.count(CollectionRun.id)).where(CollectionRun.status == "completed")
+    run_counts = session.execute(
+        select(
+            func.coalesce(
+                func.sum(case((CollectionRun.status == "completed", 1), else_=0)),
+                0,
+            ),
+            func.coalesce(
+                func.sum(case((CollectionRun.status == "failed", 1), else_=0)),
+                0,
+            ),
         )
-        or 0
-    )
-    failed_count = int(
-        session.scalar(
-            select(func.count(CollectionRun.id)).where(CollectionRun.status == "failed")
-        )
-        or 0
-    )
+    ).one()
+    successful_count, failed_count = map(int, run_counts)
     thirty_days_ago = checked_at - timedelta(days=30)
-    recent_completed = session.scalars(
-        select(CollectionRun)
+    recent_completed = session.execute(
+        select(CollectionRun.started_at, CollectionRun.completed_at)
         .where(
             CollectionRun.status == "completed",
             CollectionRun.completed_at >= thirty_days_ago,
@@ -132,16 +138,10 @@ def get_agent_status(session: Session, now: datetime | None = None) -> dict[str,
         .limit(200)
     ).all()
     durations = [
-        max(0.0, (_utc(run.completed_at) - _utc(run.started_at)).total_seconds())
-        for run in recent_completed
-        if run.completed_at is not None
+        max(0.0, (_utc(completed_at) - _utc(started_at)).total_seconds())
+        for started_at, completed_at in recent_completed
+        if completed_at is not None
     ]
-    retry_count = int(
-        session.scalar(
-            select(func.count(AgentJob.id)).where(AgentJob.attempt_count > 1)
-        )
-        or 0
-    )
     return {
         "checked_at": checked_at,
         "worker_online": bool(online_workers),
@@ -178,8 +178,37 @@ def _run_info(item: tuple[CollectionRun, str]) -> dict[str, Any]:
     }
 
 
+def _worker_items(
+    session: Session,
+    checked_at: datetime,
+) -> list[dict[str, Any]]:
+    workers = session.scalars(
+        select(AgentWorker).order_by(AgentWorker.last_heartbeat_at.desc())
+    ).all()
+    cutoff = checked_at - timedelta(seconds=WORKER_ONLINE_SECONDS)
+    return [
+        {
+            "worker_id": worker.id,
+            "status": (
+                worker.status
+                if worker.status != "offline"
+                and _utc(worker.last_heartbeat_at) >= cutoff
+                else "offline"
+            ),
+            "started_at": worker.started_at,
+            "last_heartbeat_at": worker.last_heartbeat_at,
+            "active_job_id": (
+                str(worker.active_job_id) if worker.active_job_id else None
+            ),
+            "last_error": worker.last_error,
+            "version": worker.version,
+        }
+        for worker in workers
+    ]
+
+
 def list_agent_workers(session: Session) -> list[dict[str, Any]]:
-    return get_agent_status(session)["workers"]
+    return _worker_items(session, datetime.now(timezone.utc))
 
 
 def list_agent_schedules(session: Session) -> list[dict[str, Any]]:

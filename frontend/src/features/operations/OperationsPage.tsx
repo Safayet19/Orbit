@@ -1,4 +1,11 @@
-import { useEffect, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
@@ -12,7 +19,12 @@ import {
   Wifi,
   WifiOff,
 } from "lucide-react";
-import { useSearchParams } from "react-router-dom";
+import {
+  useBeforeUnload,
+  useBlocker,
+  useSearchParams,
+} from "react-router-dom";
+import { ConfirmationDialog } from "../../components/ui/ConfirmationDialog";
 import {
   Button,
   EmptyState,
@@ -27,7 +39,7 @@ import {
   StatusBadge,
 } from "../../components/ui/Primitives";
 import { useToast } from "../../components/ui/Toast";
-import { api } from "../../services/api";
+import { api, userFacingError } from "../../services/api";
 import {
   useAgentDecisions,
   useAgentJobs,
@@ -39,31 +51,64 @@ import {
 } from "../../services/queries";
 import type { AgentSchedule, AgentStatus, CollectionRun } from "../../types/api";
 
+type ScheduleAction = "pause" | "resume" | "enable";
+type ScheduleChanges = {
+  mode?: "fixed" | "adaptive" | "paused";
+  enabled?: boolean;
+  base_interval_seconds?: number;
+  priority?: number;
+};
+type ScheduleUpdateResult = {
+  mode: "fixed" | "adaptive" | "paused";
+  enabled: boolean;
+  base_interval_seconds: number;
+  priority: number;
+};
+
 export default function OperationsPage() {
+  const mounted = useRef(false);
   const [params, setParams] = useSearchParams();
   const selectedRunId = params.get("run") ?? undefined;
   const [manualSourceId, setManualSourceId] = useState("");
   const [filterSourceId, setFilterSourceId] = useState("");
   const [jobState, setJobState] = useState("");
   const [decisionPage, setDecisionPage] = useState(1);
+  const [runConfirmationOpen, setRunConfirmationOpen] = useState(false);
+  const [scheduleConfirmation, setScheduleConfirmation] = useState<{
+    schedule: AgentSchedule;
+    action: ScheduleAction;
+  } | null>(null);
+  const [dirtySchedules, setDirtySchedules] = useState<Record<string, true>>({});
+  const [savingSchedules, setSavingSchedules] = useState<Record<string, true>>({});
   const status = useAgentStatus();
   const schedules = useAgentSchedules();
   const jobs = useAgentJobs(1, filterSourceId || undefined, jobState || undefined);
   const decisions = useAgentDecisions(decisionPage, filterSourceId || undefined);
-  const runs = useRuns(1);
+  const runs = useRuns(1, undefined, !selectedRunId);
   const sources = useSources();
   const selectedRun = useRun(selectedRunId);
   const notify = useToast();
   const client = useQueryClient();
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
-  const refreshAgent = async () => {
-    await Promise.all([
-      client.invalidateQueries({ queryKey: ["agent-status"] }),
-      client.invalidateQueries({ queryKey: ["agent-schedules"] }),
-      client.invalidateQueries({ queryKey: ["agent-jobs"] }),
-      client.invalidateQueries({ queryKey: ["agent-decisions"] }),
-      client.invalidateQueries({ queryKey: ["runs"] }),
-    ]);
+  const refreshAgent = async (
+    queryKeys: string[][] = [
+      ["agent-status"],
+      ["agent-schedules"],
+      ["agent-jobs"],
+      ["agent-decisions"],
+      ["runs"],
+      ["sources"],
+    ],
+  ) => {
+    await Promise.all(
+      queryKeys.map((queryKey) => client.invalidateQueries({ queryKey })),
+    );
   };
 
   const start = useMutation({
@@ -73,15 +118,10 @@ export default function OperationsPage() {
         body: JSON.stringify({ source_id: id }),
       }),
     onSuccess: async (result) => {
-      setParams({ run: result.run_id });
+        if (mounted.current) setParams({ run: result.run_id });
       notify("success", `Collection run started · ${result.run_id}`);
       await refreshAgent();
     },
-    onError: (reason) =>
-      notify(
-        "error",
-        reason instanceof Error ? reason.message : "Collection could not start.",
-      ),
   });
 
   const updateSchedule = useMutation({
@@ -90,42 +130,114 @@ export default function OperationsPage() {
       changes,
     }: {
       sourceKey: string;
-      changes: Record<string, unknown>;
+      changes: ScheduleChanges;
+      successMessage?: string;
     }) =>
-      api(`/api/admin/agent/schedules/${sourceKey}`, {
-        method: "PATCH",
-        body: JSON.stringify(changes),
-      }),
-    onSuccess: async () => {
-      notify("success", "Scheduling policy updated.");
-      await refreshAgent();
-    },
-    onError: (reason) =>
-      notify(
-        "error",
-        reason instanceof Error ? reason.message : "Schedule update failed.",
+      api<ScheduleUpdateResult>(
+        `/api/admin/agent/schedules/${encodeURIComponent(sourceKey)}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify(changes),
+        },
       ),
+    onSuccess: async (_result, { successMessage }) => {
+      notify("success", successMessage ?? "Scheduling policy updated.");
+      await refreshAgent([
+        ["agent-status"],
+        ["agent-schedules"],
+        ["agent-decisions"],
+      ]);
+    },
   });
 
   const toggleSchedule = useMutation({
     mutationFn: ({ sourceKey, paused }: { sourceKey: string; paused: boolean }) =>
       api(
-        `/api/admin/agent/schedules/${sourceKey}/${paused ? "resume" : "pause"}`,
+        `/api/admin/agent/schedules/${encodeURIComponent(sourceKey)}/${paused ? "resume" : "pause"}`,
         { method: "POST" },
       ),
-    onSuccess: async () => {
-      notify("success", "Source scheduling updated.");
-      await refreshAgent();
+    onSuccess: async (_result, { paused }) => {
+      notify("success", paused ? "Automatic scheduling resumed." : "Automatic scheduling paused.");
+      await refreshAgent([
+        ["agent-status"],
+        ["agent-schedules"],
+        ["agent-decisions"],
+      ]);
     },
-    onError: (reason) =>
-      notify(
-        "error",
-        reason instanceof Error ? reason.message : "Schedule action failed.",
-      ),
   });
 
   const eligible =
     sources.data?.items.filter((source) => source.enabled && source.supported) ?? [];
+  const selectedSource = eligible.find(
+    (source) => source.source_key === manualSourceId,
+  );
+  const hasUnsavedChanges = Object.keys(dirtySchedules).length > 0;
+  const hasPendingScheduleSave = Object.keys(savingSchedules).length > 0;
+  const blocker = useBlocker(
+    ({ currentLocation, nextLocation }) =>
+      hasUnsavedChanges &&
+      currentLocation.pathname !== nextLocation.pathname,
+  );
+  useEffect(() => {
+    if (blocker.state === "blocked" && !hasUnsavedChanges) {
+      blocker.proceed();
+    }
+  }, [blocker, hasUnsavedChanges]);
+  useBeforeUnload(
+    useCallback(
+      (event) => {
+        if (hasUnsavedChanges) {
+          event.preventDefault();
+          event.returnValue = "";
+        }
+      },
+      [hasUnsavedChanges],
+    ),
+  );
+  const updateScheduleDirtyState = useCallback(
+    (sourceKey: string, dirty: boolean) => {
+      setDirtySchedules((current) => {
+        if (dirty) {
+          return current[sourceKey] ? current : { ...current, [sourceKey]: true };
+        }
+        if (!current[sourceKey]) return current;
+        const next = { ...current };
+        delete next[sourceKey];
+        return next;
+      });
+    },
+    [],
+  );
+  const updateScheduleSavingState = useCallback(
+    (sourceKey: string, saving: boolean) => {
+      setSavingSchedules((current) => {
+        if (saving) {
+          return current[sourceKey] ? current : { ...current, [sourceKey]: true };
+        }
+        if (!current[sourceKey]) return current;
+        const next = { ...current };
+        delete next[sourceKey];
+        return next;
+      });
+    },
+    [],
+  );
+  const confirmScheduleAction = async () => {
+    if (!scheduleConfirmation) return;
+    const { schedule, action } = scheduleConfirmation;
+    if (action === "enable") {
+      await updateSchedule.mutateAsync({
+        sourceKey: schedule.source_id,
+        changes: { enabled: true },
+        successMessage: "Automatic scheduling enabled.",
+      });
+      return;
+    }
+    await toggleSchedule.mutateAsync({
+      sourceKey: schedule.source_id,
+      paused: action === "resume",
+    });
+  };
   const workerError = status.isError || schedules.isError;
   const overview = status.data;
 
@@ -279,22 +391,27 @@ export default function OperationsPage() {
             <strong>Manual collection</strong>
             <span>Manual runs use the same persistent job and lease protections.</span>
           </div>
-          <select
-            className="control"
-            value={manualSourceId}
-            onChange={(event) => setManualSourceId(event.target.value)}
-            aria-label="Select source for manual collection"
-          >
-            <option value="">Select a source</option>
-            {eligible.map((source) => (
-              <option key={source.id} value={source.source_key}>
-                {source.name}
-              </option>
-            ))}
-          </select>
+          <label className="run-source-select">
+            Source
+            <select
+              className="control"
+              value={manualSourceId}
+              onChange={(event) => setManualSourceId(event.target.value)}
+              aria-label="Select source for manual collection"
+              disabled={start.isPending}
+              required
+            >
+              <option value="">Select a source</option>
+              {eligible.map((source) => (
+                <option key={source.id} value={source.source_key}>
+                  {source.name}
+                </option>
+              ))}
+            </select>
+          </label>
           <Button
-            disabled={!manualSourceId || start.isPending}
-            onClick={() => start.mutate(manualSourceId)}
+            disabled={!selectedSource || start.isPending}
+            onClick={() => setRunConfirmationOpen(true)}
           >
             <Play size={15} />
             {start.isPending ? "Starting…" : "Run collection"}
@@ -349,17 +466,16 @@ export default function OperationsPage() {
                       updateSchedule.isPending || toggleSchedule.isPending
                     }
                     onSave={(changes) =>
-                      updateSchedule.mutate({
+                      updateSchedule.mutateAsync({
                         sourceKey: schedule.source_id,
                         changes,
                       })
                     }
-                    onToggle={() =>
-                      toggleSchedule.mutate({
-                        sourceKey: schedule.source_id,
-                        paused: schedule.mode === "paused",
-                      })
+                    onAction={(action) =>
+                      setScheduleConfirmation({ schedule, action })
                     }
+                    onDirtyChange={updateScheduleDirtyState}
+                    onSavingChange={updateScheduleSavingState}
                   />
                 ))}
               </tbody>
@@ -606,6 +722,74 @@ export default function OperationsPage() {
           />
         )}
       </Panel>
+      <ConfirmationDialog
+        open={runConfirmationOpen}
+        onOpenChange={setRunConfirmationOpen}
+        title="Start data collection?"
+        description={`Start a new collection for ${selectedSource?.name ?? "this source"}? Orbit will retrieve source data, validate it, and update stored records when changes are detected.`}
+        confirmLabel="Start collection"
+        pendingLabel="Starting…"
+        errorFallback="Collection could not be started. Please try again."
+        onConfirm={async () => {
+          if (!selectedSource?.enabled || !selectedSource.supported) {
+            throw new Error("Select an enabled source with an approved collector.");
+          }
+          await start.mutateAsync(selectedSource.source_key);
+        }}
+      />
+      {scheduleConfirmation && (
+        <ConfirmationDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setScheduleConfirmation(null);
+          }}
+          title={
+            scheduleConfirmation.action === "pause"
+              ? "Pause automatic collection?"
+              : scheduleConfirmation.action === "resume"
+                ? "Resume automatic collection?"
+                : "Enable automatic scheduling?"
+          }
+          description={
+            scheduleConfirmation.action === "pause"
+              ? `Automatic scheduling for ${scheduleConfirmation.schedule.source_name} will be paused. This does not cancel a collection that is already running.`
+              : scheduleConfirmation.action === "resume"
+                ? `Orbit will resume scheduling collection jobs for ${scheduleConfirmation.schedule.source_name} according to its configured policy.`
+                : scheduleConfirmation.schedule.mode === "paused"
+                  ? `Orbit will enable scheduling for ${scheduleConfirmation.schedule.source_name}. Its existing pause will remain in effect until you resume it.`
+                  : `Orbit will begin applying the configured collection schedule for ${scheduleConfirmation.schedule.source_name}.`
+          }
+          confirmLabel={
+            scheduleConfirmation.action === "pause"
+              ? "Pause scheduling"
+              : scheduleConfirmation.action === "resume"
+                ? "Resume scheduling"
+                : "Enable scheduling"
+          }
+          pendingLabel="Updating schedule…"
+          errorFallback="Unable to update the schedule. Please try again."
+          onConfirm={confirmScheduleAction}
+        />
+      )}
+      <ConfirmationDialog
+        open={blocker.state === "blocked"}
+        onOpenChange={(open) => {
+          if (!open && blocker.state === "blocked") blocker.reset();
+        }}
+        title="Discard unsaved changes?"
+        confirmLabel="Discard changes"
+        cancelLabel="Keep editing"
+        pendingLabel="Leaving…"
+        confirmDisabled={hasPendingScheduleSave}
+        description={
+          hasPendingScheduleSave
+            ? "A schedule change is being saved. Keep editing until the save finishes."
+            : "You have changes that haven't been saved. Leaving this page will discard them."
+        }
+        onConfirm={() => {
+          if (blocker.state === "blocked") blocker.proceed();
+        }}
+      />
     </>
   );
 }
@@ -614,25 +798,145 @@ function ScheduleRow({
   schedule,
   disabled,
   onSave,
-  onToggle,
+  onAction,
+  onDirtyChange,
+  onSavingChange,
 }: {
   schedule: AgentSchedule;
   disabled: boolean;
-  onSave: (changes: Record<string, unknown>) => void;
-  onToggle: () => void;
+  onSave: (changes: ScheduleChanges) => Promise<ScheduleUpdateResult>;
+  onAction: (action: ScheduleAction) => void;
+  onDirtyChange: (sourceKey: string, dirty: boolean) => void;
+  onSavingChange: (sourceKey: string, saving: boolean) => void;
 }) {
-  const [mode, setMode] = useState<"fixed" | "adaptive">(
-    schedule.mode === "fixed" ? "fixed" : "adaptive",
+  const savedMode = schedule.mode === "fixed" ? "fixed" : "adaptive";
+  const savedIntervalHours = String(
+    Math.max(1, Math.round(schedule.base_interval_seconds / 3600)),
   );
-  const [intervalHours, setIntervalHours] = useState(
-    String(Math.max(1, Math.round(schedule.base_interval_seconds / 3600))),
+  const savedPriority = String(schedule.priority);
+  const [mode, setMode] = useState<"fixed" | "adaptive">(savedMode);
+  const [intervalHours, setIntervalHours] = useState(savedIntervalHours);
+  const [priority, setPriority] = useState(savedPriority);
+  const [baseline, setBaseline] = useState({
+    mode: savedMode,
+    intervalHours: savedIntervalHours,
+    priority: savedPriority,
+  });
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const intervalRef = useRef<HTMLInputElement>(null);
+  const priorityRef = useRef<HTMLInputElement>(null);
+  const id = useId();
+  const isDirty =
+    mode !== baseline.mode ||
+    intervalHours !== baseline.intervalHours ||
+    priority !== baseline.priority;
+  const minimumHours = Math.max(
+    1,
+    Math.ceil(schedule.minimum_interval_seconds / 3600),
   );
-  const [priority, setPriority] = useState(String(schedule.priority));
+  const maximumHours = Math.floor(
+    Math.min(schedule.maximum_interval_seconds, 7_776_000) / 3600,
+  );
+  const intervalValue = Number(intervalHours);
+  const intervalError =
+    intervalHours.trim() === ""
+      ? "Interval is required."
+      : !Number.isInteger(intervalValue)
+        ? "Enter a whole number of hours."
+        : intervalValue < minimumHours
+          ? `Minimum interval is ${minimumHours} hours.`
+          : intervalValue > maximumHours
+            ? `Maximum interval is ${maximumHours} hours.`
+            : null;
+  const priorityValue = Number(priority);
+  const priorityError =
+    priority.trim() === ""
+      ? "Priority is required."
+      : !Number.isInteger(priorityValue)
+        ? "Enter a whole-number priority."
+        : priorityValue < 1 || priorityValue > 10
+          ? "Priority must be between 1 and 10."
+          : null;
+
   useEffect(() => {
-    setMode(schedule.mode === "fixed" ? "fixed" : "adaptive");
-    setIntervalHours(String(Math.max(1, Math.round(schedule.base_interval_seconds / 3600))));
-    setPriority(String(schedule.priority));
-  }, [schedule.mode, schedule.base_interval_seconds, schedule.priority]);
+    if (isDirty || saving) return;
+    setMode(savedMode);
+    setIntervalHours(savedIntervalHours);
+    setPriority(savedPriority);
+    setBaseline({
+      mode: savedMode,
+      intervalHours: savedIntervalHours,
+      priority: savedPriority,
+    });
+  }, [
+    isDirty,
+    savedIntervalHours,
+    savedMode,
+    savedPriority,
+    saving,
+  ]);
+
+  useEffect(() => {
+    onDirtyChange(schedule.source_id, isDirty);
+  }, [isDirty, onDirtyChange, schedule.source_id]);
+
+  const save = async () => {
+    setSaveError(null);
+    if (intervalError) {
+      intervalRef.current?.focus();
+      return;
+    }
+    if (priorityError) {
+      priorityRef.current?.focus();
+      return;
+    }
+    if (!isDirty || saving) return;
+
+    setSaving(true);
+    onSavingChange(schedule.source_id, true);
+    try {
+      const result = await onSave({
+        mode,
+        base_interval_seconds: Math.round(intervalValue * 3600),
+        priority: priorityValue,
+      });
+      const next: {
+        mode: "fixed" | "adaptive";
+        intervalHours: string;
+        priority: string;
+      } = {
+        mode: result.mode === "fixed" ? "fixed" : "adaptive",
+        intervalHours: String(
+          Math.max(1, Math.round(result.base_interval_seconds / 3600)),
+        ),
+        priority: String(result.priority),
+      };
+      setMode(next.mode);
+      setIntervalHours(next.intervalHours);
+      setPriority(next.priority);
+      setBaseline(next);
+      onDirtyChange(schedule.source_id, false);
+    } catch (reason) {
+      setSaveError(
+        userFacingError(reason, "Unable to save the schedule. Please try again."),
+      );
+    } finally {
+      setSaving(false);
+      onSavingChange(schedule.source_id, false);
+    }
+  };
+
+  const scheduleAction: ScheduleAction = !schedule.enabled
+    ? "enable"
+    : schedule.mode === "paused"
+      ? "resume"
+      : "pause";
+  const canEdit =
+    schedule.approved &&
+    schedule.source_enabled &&
+    schedule.enabled &&
+    schedule.mode !== "paused";
 
   return (
     <tr>
@@ -644,9 +948,13 @@ function ScheduleRow({
         <select
           className="control schedule-select"
           value={mode}
-          onChange={(event) => setMode(event.target.value as "fixed" | "adaptive")}
+          onChange={(event) => {
+            if (event.target.value === "fixed" || event.target.value === "adaptive") {
+              setMode(event.target.value);
+            }
+          }}
           aria-label={`Scheduling mode for ${schedule.source_name}`}
-          disabled={schedule.mode === "paused"}
+          disabled={!canEdit || disabled || saving}
         >
           <option value="adaptive">Adaptive</option>
           <option value="fixed">Fixed</option>
@@ -657,16 +965,26 @@ function ScheduleRow({
           <input
             type="number"
             className="agent-number"
-            min={Math.ceil(schedule.minimum_interval_seconds / 3600)}
-            max={Math.floor(schedule.maximum_interval_seconds / 3600)}
+            ref={intervalRef}
+            id={`${id}-interval`}
+            min={minimumHours}
+            max={maximumHours}
             step="1"
             value={intervalHours}
+            required
+            aria-invalid={Boolean(intervalError)}
+            aria-describedby={intervalError ? `${id}-interval-error` : undefined}
             onChange={(event) => setIntervalHours(event.target.value)}
             aria-label={`Base interval hours for ${schedule.source_name}`}
-            disabled={schedule.mode === "paused"}
+            disabled={!canEdit || disabled || saving}
           />
           <span>hours</span>
         </label>
+        {intervalError && (
+          <span className="schedule-field-error" id={`${id}-interval-error`} role="alert">
+            {intervalError}
+          </span>
+        )}
       </td>
       <td>
         {schedule.last_successful_at
@@ -685,14 +1003,24 @@ function ScheduleRow({
         <input
           type="number"
           className="agent-number agent-priority"
+          ref={priorityRef}
+          id={`${id}-priority`}
           min="1"
           max="10"
           step="1"
           value={priority}
+          required
+          aria-invalid={Boolean(priorityError)}
+          aria-describedby={priorityError ? `${id}-priority-error` : undefined}
           onChange={(event) => setPriority(event.target.value)}
           aria-label={`Priority for ${schedule.source_name}`}
-          disabled={schedule.mode === "paused"}
+          disabled={!canEdit || disabled || saving}
         />
+        {priorityError && (
+          <span className="schedule-field-error" id={`${id}-priority-error`} role="alert">
+            {priorityError}
+          </span>
+        )}
       </td>
       <td>
         <StatusBadge status={schedule.health_status} />
@@ -711,35 +1039,29 @@ function ScheduleRow({
             variant="secondary"
             disabled={
               disabled ||
-              !schedule.approved ||
-              !schedule.source_enabled ||
-              !schedule.enabled ||
-              schedule.mode === "paused" ||
-              Number(intervalHours) <
-                Math.ceil(schedule.minimum_interval_seconds / 3600) ||
-              Number(intervalHours) >
-                Math.floor(schedule.maximum_interval_seconds / 3600) ||
-              !Number.isInteger(Number(priority)) ||
-              Number(priority) < 1 ||
-              Number(priority) > 10
+              saving ||
+              !canEdit ||
+              !isDirty
             }
-            onClick={() =>
-              onSave({
-                mode,
-                base_interval_seconds: Math.round(Number(intervalHours) * 3600),
-                priority: Number(priority),
-              })
-            }
+            onClick={() => void save()}
           >
-            Save
+            {saving ? "Saving…" : "Save"}
           </Button>
           <Button
             variant={schedule.mode === "paused" || !schedule.enabled ? "primary" : "quiet"}
-            disabled={disabled || !schedule.approved || !schedule.source_enabled}
-            onClick={() => {
-              if (!schedule.enabled) onSave({ enabled: true });
-              else onToggle();
-            }}
+            disabled={
+              disabled ||
+              saving ||
+              isDirty ||
+              !schedule.approved ||
+              !schedule.source_enabled
+            }
+            title={
+              isDirty
+                ? "Save or discard policy changes before changing the schedule."
+                : undefined
+            }
+            onClick={() => onAction(scheduleAction)}
             aria-label={`${!schedule.enabled ? "Enable" : schedule.mode === "paused" ? "Resume" : "Pause"} ${schedule.source_name}`}
           >
             {!schedule.enabled ? (
@@ -757,6 +1079,11 @@ function ScheduleRow({
             )}
           </Button>
         </div>
+        {saveError && (
+          <span className="schedule-save-error" role="alert">
+            {saveError}
+          </span>
+        )}
       </td>
     </tr>
   );

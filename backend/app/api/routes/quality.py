@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, literal, select, union_all
+from sqlalchemy import case, func, literal, select, union_all
 from sqlalchemy.orm import Session
 
 from backend.app.api.auth import get_admin_session
@@ -31,41 +31,58 @@ def quality_summary(
     now = datetime.now(timezone.utc)
     valid_records = int(session.scalar(select(func.count(CurrentRecord.id))) or 0)
     invalid_records = int(session.scalar(select(func.count(InvalidRecord.id))) or 0)
-    failed_runs = int(
-        session.scalar(
-            select(func.count(CollectionRun.id)).where(CollectionRun.status == "failed")
-        )
-        or 0
-    )
-    recent_failed_sources = int(
-        session.scalar(
-            select(func.count(func.distinct(CollectionRun.source_id))).where(
-                CollectionRun.status == "failed",
-                CollectionRun.started_at >= now - timedelta(days=7),
-            )
-        )
-        or 0
-    )
-    enabled_sources = int(
-        session.scalar(select(func.count(Source.id)).where(Source.enabled.is_(True))) or 0
-    )
     stale_before = now - timedelta(days=7)
-    stale_sources = int(
-        session.scalar(
-            select(func.count(Source.id))
-            .where(Source.enabled.is_(True))
-            .where(
-                ~select(CollectionRun.id)
-                .where(
-                    CollectionRun.source_id == Source.id,
-                    CollectionRun.status == "completed",
-                    CollectionRun.completed_at >= stale_before,
-                )
-                .exists()
-            )
+    recent_completed_run = (
+        select(CollectionRun.id)
+        .where(
+            CollectionRun.source_id == Source.id,
+            CollectionRun.status == "completed",
+            CollectionRun.completed_at >= stale_before,
         )
-        or 0
+        .exists()
     )
+    source_counts = session.execute(
+        select(
+            func.coalesce(
+                func.sum(case((Source.enabled.is_(True), 1), else_=0)),
+                0,
+            ),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            Source.enabled.is_(True) & ~recent_completed_run,
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ),
+        )
+    ).one()
+    enabled_sources, stale_sources = map(int, source_counts)
+    run_counts = session.execute(
+        select(
+            func.coalesce(
+                func.sum(case((CollectionRun.status == "failed", 1), else_=0)),
+                0,
+            ),
+            func.count(
+                func.distinct(
+                    case(
+                        (
+                            (CollectionRun.status == "failed")
+                            & (CollectionRun.started_at >= now - timedelta(days=7)),
+                            CollectionRun.source_id,
+                        ),
+                        else_=None,
+                    )
+                )
+            ),
+        )
+    ).one()
+    failed_runs, recent_failed_sources = map(int, run_counts)
     status_value = (
         "unknown"
         if not enabled_sources

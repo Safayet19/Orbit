@@ -37,6 +37,7 @@ WORKER_HEARTBEAT_SECONDS = 20
 WORKER_OFFLINE_SECONDS = 90
 JOB_LEASE_SECONDS = 180
 MAX_CLAIM_BATCH = 100
+ACTIVE_JOB_STATUSES = ("queued", "running", "retry_wait")
 
 
 @dataclass(frozen=True)
@@ -72,18 +73,26 @@ def _record_decision(
     )
 
 
-def _active_job_exists(session: Session, source_id: uuid.UUID) -> bool:
-    return (
-        session.scalar(
-            select(AgentJob.id)
+def _active_job_source_ids(
+    session: Session,
+    source_ids: set[uuid.UUID],
+) -> set[uuid.UUID]:
+    if not source_ids:
+        return set()
+    return set(
+        session.scalars(
+            select(AgentJob.source_id)
             .where(
-                AgentJob.source_id == source_id,
-                AgentJob.status.in_(("queued", "running", "retry_wait")),
+                AgentJob.source_id.in_(source_ids),
+                AgentJob.status.in_(ACTIVE_JOB_STATUSES),
             )
-            .limit(1)
-        )
-        is not None
+            .distinct()
+        ).all()
     )
+
+
+def _active_job_exists(session: Session, source_id: uuid.UUID) -> bool:
+    return source_id in _active_job_source_ids(session, {source_id})
 
 
 def _recover_expired_jobs(session: Session, now: datetime) -> int:
@@ -97,9 +106,35 @@ def _recover_expired_jobs(session: Session, now: datetime) -> int:
         .limit(MAX_CLAIM_BATCH)
         .with_for_update(skip_locked=True)
     ).all()
+    source_ids = {job.source_id for job in expired_jobs}
+    schedules = (
+        {
+            schedule.source_id: schedule
+            for schedule in session.scalars(
+                select(SourceSchedule).where(SourceSchedule.source_id.in_(source_ids))
+            ).all()
+        }
+        if source_ids
+        else {}
+    )
+    run_ids = {
+        job.collection_run_id
+        for job in expired_jobs
+        if job.collection_run_id is not None
+    }
+    runs = (
+        {
+            run.id: run
+            for run in session.scalars(
+                select(CollectionRun).where(CollectionRun.id.in_(run_ids))
+            ).all()
+        }
+        if run_ids
+        else {}
+    )
     recovered = 0
     for job in expired_jobs:
-        schedule = session.get(SourceSchedule, job.source_id)
+        schedule = schedules.get(job.source_id)
         if schedule is None:
             job.status = "failed"
             job.completed_at = now
@@ -108,7 +143,7 @@ def _recover_expired_jobs(session: Session, now: datetime) -> int:
             job.lease_expires_at = None
             continue
         if job.collection_run_id is not None:
-            run = session.get(CollectionRun, job.collection_run_id)
+            run = runs.get(job.collection_run_id)
             if run is not None and run.status == "running":
                 run.status = "failed"
                 run.quality_status = "failed"
@@ -179,19 +214,27 @@ def _enqueue_due_jobs(session: Session, now: datetime) -> int:
         .limit(MAX_CLAIM_BATCH)
         .with_for_update(skip_locked=True)
     ).all()
+    source_ids = {source.id for _, source in candidates}
+    active_source_ids = _active_job_source_ids(session, source_ids)
+    running_legacy_source_ids = (
+        set(
+            session.scalars(
+                select(CollectionRun.source_id)
+                .where(
+                    CollectionRun.source_id.in_(source_ids),
+                    CollectionRun.status == "running",
+                )
+                .distinct()
+            ).all()
+        )
+        if source_ids
+        else set()
+    )
     enqueued = 0
     for schedule, source in candidates:
-        if _active_job_exists(session, source.id):
+        if source.id in active_source_ids:
             continue
-        running_legacy_run = session.scalar(
-            select(CollectionRun.id)
-            .where(
-                CollectionRun.source_id == source.id,
-                CollectionRun.status == "running",
-            )
-            .limit(1)
-        )
-        if running_legacy_run is not None:
+        if source.id in running_legacy_source_ids:
             continue
         job = AgentJob(
             source_id=source.id,
@@ -264,6 +307,21 @@ def _claim_job(
         return (-score, _as_utc(job.created_at).timestamp(), source.source_key)
 
     rows.sort(key=priority)
+    source_ids = {source.id for _, _, source in rows}
+    running_legacy_source_ids = (
+        set(
+            session.scalars(
+                select(CollectionRun.source_id)
+                .where(
+                    CollectionRun.source_id.in_(source_ids),
+                    CollectionRun.status == "running",
+                )
+                .distinct()
+            ).all()
+        )
+        if source_ids
+        else set()
+    )
     for job, schedule, source in rows:
         if job.trigger_type == "scheduled" and schedule.mode == "paused":
             job.status = "cancelled"
@@ -282,20 +340,7 @@ def _claim_job(
                 job.id,
             )
             continue
-        if _active_job_exists(session, source.id) and job.status not in {
-            "queued",
-            "retry_wait",
-        }:
-            continue
-        legacy_run = session.scalar(
-            select(CollectionRun.id)
-            .where(
-                CollectionRun.source_id == source.id,
-                CollectionRun.status == "running",
-            )
-            .limit(1)
-        )
-        if legacy_run is not None:
+        if source.id in running_legacy_source_ids:
             continue
         job.status = "running"
         job.worker_id = worker_id

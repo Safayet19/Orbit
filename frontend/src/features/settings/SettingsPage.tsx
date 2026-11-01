@@ -31,7 +31,7 @@ export default function SettingsPage() {
           <Panel title="Collection capabilities">
             <div className="table-wrap"><table className="data-table">
               <thead><tr><th>Collector</th><th>Source identifier</th><th>Category</th><th>Available</th></tr></thead>
-              <tbody>{system.data.collectors.map((collector) => <tr key={collector.source_id}><td className="table-primary">{collector.name}</td><td className="mono">{collector.source_id}</td><td>{collector.category.replaceAll("_", " ")}</td><td><StatusBadge status="healthy" /></td></tr>)}</tbody>
+              <tbody>{system.data.collectors.map((collector) => <tr key={collector.source_id}><td className="table-primary">{collector.name}</td><td className="mono">{collector.source_id}</td><td>{collector.category.replaceAll("_", " ")}</td><td><StatusBadge status="available" /></td></tr>)}</tbody>
             </table></div>
             <div className="settings-note"><Clock3 size={16} /><span>Automatic scheduling: <strong>{system.data.scheduling.status}</strong>. Collection runs can be started manually from Agent operations.</span></div>
           </Panel>

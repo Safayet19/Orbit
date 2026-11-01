@@ -10,6 +10,11 @@ import {
 } from "recharts";
 import type { Overview } from "../../types/api";
 
+const chartDateFormatter = new Intl.DateTimeFormat(undefined, {
+  month: "short",
+  day: "numeric",
+});
+
 export function ActivityChart({ data }: { data: Overview["chart"] }) {
   if (!data.length) {
     return (
@@ -26,9 +31,7 @@ export function ActivityChart({ data }: { data: Overview["chart"] }) {
           <XAxis
             dataKey="date"
             tickFormatter={(value: string) =>
-              new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(
-                new Date(value),
-              )
+              chartDateFormatter.format(new Date(value))
             }
             stroke="#BFCBDD"
             tick={{ fill: "#D4DEEA", fontSize: 10 }}

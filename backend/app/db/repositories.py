@@ -1,5 +1,6 @@
 import uuid
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
@@ -19,6 +20,17 @@ from backend.app.db.models import (
 from backend.app.pipeline.fingerprint import content_fingerprint
 
 RecordOutcome = Literal["new", "changed", "unchanged"]
+
+
+@dataclass(frozen=True)
+class _PreparedObservation:
+    record: BaseModel
+    external_id: str
+    observed_at: datetime
+    source_url: str
+    numeric_value: Decimal | None
+    data: dict[str, Any]
+    fingerprint: str
 
 
 def get_enabled_source(session: Session, source_key: str) -> Source | None:
@@ -73,13 +85,27 @@ def upsert_observation(
     source: Source,
     record: BaseModel,
     existing_records: dict[str, CurrentRecord] | None = None,
+    *,
+    prepared: _PreparedObservation | None = None,
+    latest_version_numbers: dict[uuid.UUID, int] | None = None,
 ) -> RecordOutcome:
-    external_id = str(getattr(record, "external_record_id"))
-    observed_at: datetime = getattr(record, "observed_at")
-    source_url = str(getattr(record, "source_url"))
-    numeric_value = _numeric_value(record)
-    data = _record_data(record)
-    fingerprint = content_fingerprint(data)
+    if prepared is None:
+        data = _record_data(record)
+        prepared = _PreparedObservation(
+            record=record,
+            external_id=str(getattr(record, "external_record_id")),
+            observed_at=getattr(record, "observed_at"),
+            source_url=str(getattr(record, "source_url")),
+            numeric_value=_numeric_value(record),
+            data=data,
+            fingerprint=content_fingerprint(data),
+        )
+    external_id = prepared.external_id
+    observed_at = prepared.observed_at
+    source_url = prepared.source_url
+    numeric_value = prepared.numeric_value
+    data = prepared.data
+    fingerprint = prepared.fingerprint
     query = select(CurrentRecord).where(
         CurrentRecord.source_id == source.id,
         CurrentRecord.external_record_id == external_id,
@@ -134,13 +160,20 @@ def upsert_observation(
     if outcome != "unchanged":
         if outcome == "new":
             version_number = 1
+            if latest_version_numbers is not None:
+                latest_version_numbers[current.id] = version_number
         else:
-            latest_version = session.scalar(
-                select(func.max(RecordVersion.version_number)).where(
-                    RecordVersion.record_id == current.id
+            if latest_version_numbers is not None and current.id in latest_version_numbers:
+                latest_version = latest_version_numbers[current.id]
+            else:
+                latest_version = session.scalar(
+                    select(func.max(RecordVersion.version_number)).where(
+                        RecordVersion.record_id == current.id
+                    )
                 )
-            )
             version_number = (latest_version or 0) + 1
+            if latest_version_numbers is not None:
+                latest_version_numbers[current.id] = version_number
         session.add(
             RecordVersion(
                 record_id=current.id,
@@ -172,7 +205,21 @@ def persist_success(
     quality_details: dict[str, Any] | None = None,
 ) -> dict[str, int]:
     counts = {"new": 0, "changed": 0, "unchanged": 0}
-    external_ids = {str(getattr(record, "external_record_id")) for record in records}
+    prepared_records = []
+    for record in records:
+        data = _record_data(record)
+        prepared_records.append(
+            _PreparedObservation(
+                record=record,
+                external_id=str(getattr(record, "external_record_id")),
+                observed_at=getattr(record, "observed_at"),
+                source_url=str(getattr(record, "source_url")),
+                numeric_value=_numeric_value(record),
+                data=data,
+                fingerprint=content_fingerprint(data),
+            )
+        )
+    external_ids = {item.external_id for item in prepared_records}
     existing_records: dict[str, CurrentRecord] = {}
     if external_ids:
         current_rows = session.scalars(
@@ -187,12 +234,35 @@ def persist_success(
             current.external_record_id: current for current in current_rows
         }
 
-    for record in records:
+    changed_record_ids = {
+        current.id
+        for item in prepared_records
+        if (current := existing_records.get(item.external_id)) is not None
+        and current.fingerprint != item.fingerprint
+    }
+    latest_version_numbers = (
+        {
+            record_id: int(version_number)
+            for record_id, version_number in session.execute(
+                select(
+                    RecordVersion.record_id,
+                    func.max(RecordVersion.version_number),
+                )
+                .where(RecordVersion.record_id.in_(changed_record_ids))
+                .group_by(RecordVersion.record_id)
+            ).all()
+        }
+        if changed_record_ids
+        else {}
+    )
+    for record, prepared in zip(records, prepared_records, strict=True):
         outcome = upsert_observation(
             session,
             source,
             record,
             existing_records=existing_records,
+            prepared=prepared,
+            latest_version_numbers=latest_version_numbers,
         )
         counts[outcome] += 1
 

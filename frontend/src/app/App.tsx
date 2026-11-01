@@ -1,4 +1,4 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, type ReactNode } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import { AuthProvider, useAuth } from "./AuthContext";
 import { ProtectedLayout } from "../components/layout/ProtectedLayout";
@@ -22,22 +22,28 @@ function ApplicationRoutes() {
     return <LoginPage configurationError={setupError} />;
   }
   return (
-    <Suspense fallback={<LoadingState label="Loading workspace" />}>
-      <Routes>
-        <Route element={<ProtectedLayout />}>
-          <Route path="/" element={<OverviewPage />} />
-          <Route path="/sources" element={<SourcesPage />} />
-          <Route path="/sources/:sourceKey" element={<SourcesPage />} />
-          <Route path="/operations" element={<OperationsPage />} />
-          <Route path="/records" element={<RecordsPage />} />
-          <Route path="/records/:recordId" element={<RecordDetailPage />} />
-          <Route path="/history" element={<HistoryPage />} />
-          <Route path="/quality" element={<QualityPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
-          <Route path="/login" element={<Navigate to="/" replace />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Route>
-      </Routes>
+    <Routes>
+      <Route element={<ProtectedLayout />}>
+        <Route path="/" element={<RouteContent><OverviewPage /></RouteContent>} />
+        <Route path="/sources" element={<RouteContent><SourcesPage /></RouteContent>} />
+        <Route path="/sources/:sourceKey" element={<RouteContent><SourcesPage /></RouteContent>} />
+        <Route path="/operations" element={<RouteContent><OperationsPage /></RouteContent>} />
+        <Route path="/records" element={<RouteContent><RecordsPage /></RouteContent>} />
+        <Route path="/records/:recordId" element={<RouteContent><RecordDetailPage /></RouteContent>} />
+        <Route path="/history" element={<RouteContent><HistoryPage /></RouteContent>} />
+        <Route path="/quality" element={<RouteContent><QualityPage /></RouteContent>} />
+        <Route path="/settings" element={<RouteContent><SettingsPage /></RouteContent>} />
+        <Route path="/login" element={<Navigate to="/" replace />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Route>
+    </Routes>
+  );
+}
+
+function RouteContent({ children }: { children: ReactNode }) {
+  return (
+    <Suspense fallback={<LoadingState label="Loading page" />}>
+      {children}
     </Suspense>
   );
 }

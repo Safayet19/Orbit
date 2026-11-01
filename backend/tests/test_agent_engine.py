@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import httpx
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -39,6 +39,7 @@ from backend.app.workers.agent_worker import (
     AgentWorker,
     JobLease,
     _claim_job,
+    _enqueue_due_jobs,
     _recover_expired_jobs,
     _lease_valid,
 )
@@ -191,6 +192,37 @@ def test_worker_claims_due_sources_without_duplicate_source_claims(
         assert jobs[0].source_id == first_lease.source_id
 
 
+def test_due_job_scheduling_uses_batched_source_lookups(
+    factory: sessionmaker,
+) -> None:
+    now = datetime.now(timezone.utc)
+    _seed_sources(factory, now)
+    with factory.begin() as session:
+        schedules = session.scalars(select(SourceSchedule)).all()
+        for schedule in schedules:
+            schedule.next_due_at = now
+
+    statements: list[str] = []
+    bind = factory.kw["bind"]
+
+    def capture(_conn, _cursor, statement, _params, _context, _many):
+        if statement.lstrip().lower().startswith("select"):
+            statements.append(statement.lower())
+
+    event.listen(bind, "before_cursor_execute", capture)
+    try:
+        with factory.begin() as session:
+            assert _enqueue_due_jobs(session, now) == 3
+    finally:
+        event.remove(bind, "before_cursor_execute", capture)
+
+    assert len(statements) == 3
+    assert sum("orbit_agent_jobs" in statement for statement in statements) == 1
+    assert sum("orbit_collection_runs" in statement for statement in statements) == 1
+    with factory() as session:
+        assert len(session.scalars(select(AgentJob)).all()) == 3
+
+
 def test_expired_worker_lease_is_recovered_and_previous_run_closed(
     factory: sessionmaker,
 ) -> None:
@@ -224,6 +256,85 @@ def test_expired_worker_lease_is_recovered_and_previous_run_closed(
         assert run.status == "failed"
         assert schedule.health_status == "degraded"
         assert session.scalar(select(AgentDecision)) is not None
+
+
+def test_expired_job_recovery_batches_related_rows(factory: sessionmaker) -> None:
+    now = datetime.now(timezone.utc)
+    _seed_sources(factory, now)
+    with factory.begin() as session:
+        sources = session.scalars(select(Source)).all()
+        for index, source in enumerate(sources):
+            run = CollectionRun(
+                source_id=source.id,
+                status="running",
+                started_at=now - timedelta(minutes=10),
+            )
+            session.add(run)
+            session.flush()
+            session.add(
+                AgentJob(
+                    source_id=source.id,
+                    trigger_type="scheduled",
+                    status="running",
+                    scheduled_at=now - timedelta(minutes=10),
+                    started_at=now - timedelta(minutes=10),
+                    attempt_count=1,
+                    worker_id=f"expired-worker-{index}",
+                    lease_expires_at=now - timedelta(seconds=1),
+                    lease_generation=1,
+                    collection_run_id=run.id,
+                )
+            )
+
+    statements: list[str] = []
+    bind = factory.kw["bind"]
+
+    def capture(_conn, _cursor, statement, _params, _context, _many):
+        if statement.lstrip().lower().startswith("select"):
+            statements.append(statement.lower())
+
+    event.listen(bind, "before_cursor_execute", capture)
+    try:
+        with factory.begin() as session:
+            assert _recover_expired_jobs(session, now) == 3
+    finally:
+        event.remove(bind, "before_cursor_execute", capture)
+
+    assert sum("orbit_source_schedules" in statement for statement in statements) == 1
+    assert sum("orbit_collection_runs" in statement for statement in statements) == 1
+
+
+def test_job_claim_checks_legacy_runs_in_one_batch(factory: sessionmaker) -> None:
+    now = datetime.now(timezone.utc)
+    _seed_sources(factory, now)
+    with factory.begin() as session:
+        sources = session.scalars(select(Source)).all()
+        for source in sources:
+            run = CollectionRun(source_id=source.id, status="running")
+            session.add(run)
+            session.add(
+                AgentJob(
+                    source_id=source.id,
+                    trigger_type="scheduled",
+                    status="queued",
+                    scheduled_at=now,
+                )
+            )
+    statements: list[str] = []
+    bind = factory.kw["bind"]
+
+    def capture(_conn, _cursor, statement, _params, _context, _many):
+        if statement.lstrip().lower().startswith("select"):
+            statements.append(statement.lower())
+
+    event.listen(bind, "before_cursor_execute", capture)
+    try:
+        with factory.begin() as session:
+            assert _claim_job(session, "claim-batch-worker", now) is None
+    finally:
+        event.remove(bind, "before_cursor_execute", capture)
+
+    assert sum("orbit_collection_runs" in statement for statement in statements) == 1
 
 
 def test_stale_worker_generation_cannot_write(factory: sessionmaker) -> None:

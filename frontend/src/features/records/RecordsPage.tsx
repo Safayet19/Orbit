@@ -19,6 +19,10 @@ export default function RecordsPage() {
   const [exporting, setExporting] = useState(false);
   const sources = useSources();
   const notify = useToast();
+  const dateRangeError =
+    after && before && after > before
+      ? "Observed-after date must not be later than observed-before date."
+      : null;
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -38,11 +42,28 @@ export default function RecordsPage() {
     if (debouncedSearch) params.set("search", debouncedSearch);
     if (sourceId) params.set("source_id", sourceId);
     if (category) params.set("category", category);
-    if (after) params.set("observed_after", new Date(after).toISOString());
-    if (before) params.set("observed_before", new Date(`${before}T23:59:59`).toISOString());
+    if (!dateRangeError && after) {
+      params.set("observed_after", new Date(after).toISOString());
+    }
+    if (!dateRangeError && before) {
+      params.set("observed_before", new Date(`${before}T23:59:59`).toISOString());
+    }
     return params;
-  }, [page, pageSize, sortOrder, debouncedSearch, sourceId, category, after, before]);
-  const { data, isLoading, isError, error, refetch } = useRecords(query);
+  }, [
+    page,
+    pageSize,
+    sortOrder,
+    debouncedSearch,
+    sourceId,
+    category,
+    after,
+    before,
+    dateRangeError,
+  ]);
+  const { data, isLoading, isError, error, refetch } = useRecords(
+    query,
+    !dateRangeError,
+  );
   const selectedSource = sources.data?.items.find(
     (source) => source.source_key === sourceId,
   );
@@ -58,6 +79,7 @@ export default function RecordsPage() {
             : "Observation";
 
   async function exportData() {
+    if (dateRangeError) return;
     setExporting(true);
     try {
       const params = new URLSearchParams();
@@ -85,7 +107,7 @@ export default function RecordsPage() {
             ? `Search and inspect ${selectedSource.name} observations.`
             : "Search, filter, and inspect persisted collection records."
         }
-        action={<Button variant="secondary" disabled={exporting || !data?.pagination.total} onClick={() => void exportData()}><Download size={15} /> {exporting ? "Exporting…" : "Export CSV"}</Button>}
+        action={<Button variant="secondary" disabled={exporting || Boolean(dateRangeError) || !data?.pagination.total} onClick={() => void exportData()}><Download size={15} /> {exporting ? "Exporting…" : "Export CSV"}</Button>}
       />
       <Panel>
         <div className="toolbar">
@@ -100,7 +122,9 @@ export default function RecordsPage() {
           <label className="date-filter">Observed before<input className="control" type="date" value={before} onChange={(event) => { setBefore(event.target.value); setPage(1); }} /></label>
           <button className="button button-quiet" onClick={() => { setSortOrder(sortOrder === "desc" ? "asc" : "desc"); setPage(1); }}>Sort by Last Updated {sortOrder === "desc" ? "↓" : "↑"}</button>
         </div>
-        {isLoading ? <LoadingState /> : isError || !data ? (
+        {dateRangeError ? (
+          <div className="filter-error" role="alert">{dateRangeError}</div>
+        ) : isLoading ? <LoadingState /> : isError || !data ? (
           <ErrorState message={error instanceof Error ? error.message : "Records are unavailable."} retry={() => void refetch()} />
         ) : data.items.length ? (
           <>

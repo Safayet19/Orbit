@@ -1,7 +1,8 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, ExternalLink, Globe2, Play, Search, ShieldCheck, ToggleLeft, ToggleRight } from "lucide-react";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import { ConfirmationDialog } from "../../components/ui/ConfirmationDialog";
 import { Button, EmptyState, ErrorState, formatDateTime, formatDuration, LoadingState, PageHeader, Panel, StatusBadge } from "../../components/ui/Primitives";
 import { useToast } from "../../components/ui/Toast";
 import { api } from "../../services/api";
@@ -18,6 +19,10 @@ function SourceList() {
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState("all");
   const [state, setState] = useState("all");
+  const [pendingToggle, setPendingToggle] = useState<{
+    source: Source;
+    enabled: boolean;
+  } | null>(null);
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const notify = useToast();
@@ -27,11 +32,17 @@ function SourceList() {
         method: "PATCH",
         body: JSON.stringify({ enabled }),
       }),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["sources"] });
-      notify("success", "Source setting updated.");
+    onSuccess: async (_result, { source, enabled }) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["sources"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["source", source.source_key],
+        }),
+        queryClient.invalidateQueries({ queryKey: ["agent-schedules"] }),
+        queryClient.invalidateQueries({ queryKey: ["agent-status"] }),
+      ]);
+      notify("success", enabled ? "Source enabled." : "Source disabled.");
     },
-    onError: (reason) => notify("error", reason instanceof Error ? reason.message : "Source update failed."),
   });
   const categories = useMemo(
     () => [...new Set(data?.items.map((source) => source.category) ?? [])],
@@ -76,19 +87,18 @@ function SourceList() {
                     <td><Link className="source-title" to={`/sources/${encodeURIComponent(source.source_key)}`}><span className="source-icon"><Globe2 size={16} /></span><span><strong>{source.name}</strong><span>{source.source_key}</span></span></Link></td>
                     <td>{source.category.replaceAll("_", " ")}</td>
                     <td>{source.source_type}</td>
-                    <td><StatusBadge status={source.enabled ? "healthy" : "unknown"} /></td>
+                    <td><StatusBadge status={source.enabled ? "enabled" : "disabled"} /></td>
                     <td>{formatDateTime(source.last_collection_at)}</td>
                     <td><StatusBadge status={source.last_result} /></td>
                     <td className="mono">{source.latest_record_count.toLocaleString()}</td>
                     <td><div className="table-action-cell">
-                      <button className="icon-button" title={source.enabled ? "Disable source" : "Enable source"} aria-label={`${source.enabled ? "Disable" : "Enable"} ${source.name}`} disabled={mutation.isPending || (!source.supported && !source.enabled)} onClick={() => {
+                      <button className="icon-button" title={!source.supported && !source.enabled ? "No approved collector is registered for this source" : source.enabled ? "Disable source" : "Enable source"} aria-label={`${source.enabled ? "Disable" : "Enable"} ${source.name}`} disabled={mutation.isPending || (!source.supported && !source.enabled)} onClick={() => {
                         const next = !source.enabled;
                         if (next && !source.supported) {
                           notify("error", "No approved collector is registered for this source.");
                           return;
                         }
-                        if (!window.confirm(`${next ? "Enable" : "Disable"} ${source.name}?`)) return;
-                        mutation.mutate({ source, enabled: next });
+                        setPendingToggle({ source, enabled: next });
                       }}>{source.enabled ? <ToggleRight size={19} /> : <ToggleLeft size={19} />}</button>
                       <button className="text-link" onClick={() => navigate(`/sources/${encodeURIComponent(source.source_key)}`)}>Details</button>
                     </div></td>
@@ -100,32 +110,66 @@ function SourceList() {
         ) : <EmptyState title="No matching sources" description="Adjust the search or filters to see registered sources." />}
         <div className="table-footnote"><ShieldCheck size={14} /> Only registered, approved collectors can be run.</div>
       </Panel>
+      {pendingToggle && (
+        <ConfirmationDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setPendingToggle(null);
+          }}
+          title={
+            pendingToggle.enabled
+              ? "Enable this data source?"
+              : "Disable this data source?"
+          }
+          description={
+            pendingToggle.enabled
+              ? `This will make ${pendingToggle.source.name} available for approved collection operations. Any existing scheduling rules will follow their current configuration.`
+              : `Collection will be disabled for ${pendingToggle.source.name}. Existing collected records and history will remain available.`
+          }
+          confirmLabel={pendingToggle.enabled ? "Enable source" : "Disable source"}
+          pendingLabel="Updating source…"
+          errorFallback="Unable to update the source. Please try again."
+          onConfirm={async () => {
+            if (pendingToggle.enabled && !pendingToggle.source.supported) {
+              throw new Error("No approved collector is registered for this source.");
+            }
+            await mutation.mutateAsync(pendingToggle);
+          }}
+        />
+      )}
     </>
   );
 }
 
 function SourceDetail({ sourceKey }: { sourceKey: string }) {
+  const mounted = useRef(false);
   const { data, isLoading, isError, error, refetch } = useSource(sourceKey);
   const navigate = useNavigate();
   const notify = useToast();
-  const [running, setRunning] = useState(false);
-
-  async function startCollection() {
-    if (!window.confirm(`Start a collection for ${String(data?.name)}?`)) return;
-    setRunning(true);
-    try {
-      const response = await api<{ run_id: string }>("/api/admin/collections", {
+  const queryClient = useQueryClient();
+  const [runConfirmationOpen, setRunConfirmationOpen] = useState(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const start = useMutation({
+    mutationFn: (sourceId: string) =>
+      api<{ run_id: string }>("/api/admin/collections", {
         method: "POST",
-        body: JSON.stringify({ source_id: sourceKey }),
-      });
-      notify("success", `Collection queued · ${response.run_id}`);
-      navigate(`/operations?run=${response.run_id}`);
-    } catch (reason) {
-      notify("error", reason instanceof Error ? reason.message : "Could not start collection.");
-    } finally {
-      setRunning(false);
-    }
-  }
+        body: JSON.stringify({ source_id: sourceId }),
+      }),
+    onSuccess: async (response) => {
+      notify("success", `Collection started · ${response.run_id}`);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["runs"] }),
+        queryClient.invalidateQueries({ queryKey: ["overview"] }),
+        queryClient.invalidateQueries({ queryKey: ["agent-status"] }),
+      ]);
+      if (mounted.current) navigate(`/operations?run=${response.run_id}`);
+    },
+  });
 
   if (isLoading) return <LoadingState />;
   if (isError || !data) return <ErrorState message={error instanceof Error ? error.message : "Source details are unavailable."} retry={() => void refetch()} />;
@@ -137,10 +181,25 @@ function SourceDetail({ sourceKey }: { sourceKey: string }) {
       <PageHeader
         title={String(data.name)}
         description="Source configuration, access details, and execution history."
-        action={<Button onClick={() => void startCollection()} disabled={!data.enabled || !data.supported || running}><Play size={15} /> {running ? "Queueing…" : "Run collection"}</Button>}
+        action={<Button onClick={() => setRunConfirmationOpen(true)} disabled={!data.enabled || !data.supported || start.isPending}><Play size={15} /> {start.isPending ? "Starting…" : "Run collection"}</Button>}
+      />
+      <ConfirmationDialog
+        open={runConfirmationOpen}
+        onOpenChange={setRunConfirmationOpen}
+        title="Start data collection?"
+        description={`Start a new collection for ${String(data.name)}? Orbit will retrieve source data, validate it, and update stored records when changes are detected.`}
+        confirmLabel="Start collection"
+        pendingLabel="Starting…"
+        errorFallback="Collection could not be started. Please try again."
+        onConfirm={async () => {
+          if (!data.enabled || !data.supported) {
+            throw new Error("This source is not enabled for approved collection.");
+          }
+          await start.mutateAsync(sourceKey);
+        }}
       />
       <div className="detail-grid source-detail-grid">
-        <DetailCell label="State"><StatusBadge status={data.enabled ? "healthy" : "unknown"} /></DetailCell>
+        <DetailCell label="State"><StatusBadge status={data.enabled ? "enabled" : "disabled"} /></DetailCell>
         <DetailCell label="Collection adapter">{data.supported ? "World Bank API · approved" : "No approved adapter"}</DetailCell>
         <DetailCell label="Category">{String(data.category).replaceAll("_", " ")}</DetailCell>
         <DetailCell label="Official source"><a className="text-link" href={String(data.official_url)} target="_blank" rel="noreferrer">Open source <ExternalLink size={13} /></a></DetailCell>

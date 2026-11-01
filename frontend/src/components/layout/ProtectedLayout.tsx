@@ -18,8 +18,11 @@ import { useQueryClient } from "@tanstack/react-query";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useState } from "react";
 import { useAuth } from "../../app/AuthContext";
+import { ApiError } from "../../services/api";
+import { ConfirmationDialog } from "../ui/ConfirmationDialog";
 import { Button } from "../ui/Primitives";
 import { useToast } from "../ui/Toast";
+import { useApiHealth } from "../../services/queries";
 
 const navigation = [
   { title: "Workspace", items: [{ label: "Overview", path: "/", icon: LayoutDashboard }] },
@@ -53,26 +56,85 @@ const titles: Record<string, string> = {
 
 export function ProtectedLayout() {
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [logoutOpen, setLogoutOpen] = useState(false);
   const { user, logout } = useAuth();
   const queryClient = useQueryClient();
   const notify = useToast();
   const navigate = useNavigate();
   const location = useLocation();
+  const health = useApiHealth();
 
-  const onLogout = async () => {
+  const confirmLogout = async () => {
     try {
       await logout();
-      queryClient.clear();
-      navigate("/login", { replace: true });
     } catch (error) {
-      notify("error", error instanceof Error ? error.message : "Sign out failed.");
+      if (error instanceof ApiError && error.status === 401) {
+        queryClient.clear();
+        notify("error", "Your session has expired. Please sign in again.");
+        navigate("/login", { replace: true });
+        return;
+      }
+      throw error;
     }
+    notify("success", "Signed out successfully.");
+    queryClient.clear();
+    navigate("/login", { replace: true });
   };
+
+  const apiStatus =
+    health.data?.status === "ok"
+      ? "API connected"
+      : health.isLoading
+        ? "Checking API"
+        : "API unavailable";
 
   const title =
     titles[location.pathname] ??
     (location.pathname.startsWith("/sources/") ? "Source details" :
       location.pathname.startsWith("/records/") ? "Record details" : "Orbit");
+
+  const refreshCurrentPage = () => {
+    const path = location.pathname;
+    const queryKeys: readonly (readonly unknown[])[] =
+      path === "/"
+        ? [["overview"], ["sources"]]
+        : path.startsWith("/sources/")
+          ? [
+              ["source", decodeURIComponent(path.slice("/sources/".length))],
+              ["sources"],
+              ["runs"],
+            ]
+          : path === "/sources"
+            ? [["sources"]]
+            : path === "/operations"
+              ? [
+                  ["agent-status"],
+                  ["agent-schedules"],
+                  ["agent-jobs"],
+                  ["agent-decisions"],
+                  ["runs"],
+                ]
+              : path === "/records"
+                ? [["records"]]
+                : path.startsWith("/records/")
+                  ? [
+                      ["record", decodeURIComponent(path.slice("/records/".length))],
+                      [
+                        "record-versions",
+                        decodeURIComponent(path.slice("/records/".length)),
+                      ],
+                    ]
+                  : path === "/history"
+                    ? [["history"]]
+                    : path === "/quality"
+                      ? [["quality"], ["quality-issues"]]
+                      : path === "/settings"
+                        ? [["system"]]
+                        : [];
+    void Promise.all(
+      queryKeys.map((queryKey) => queryClient.invalidateQueries({ queryKey })),
+    );
+  };
 
   return (
     <div className="app-shell">
@@ -135,7 +197,7 @@ export function ProtectedLayout() {
               className="icon-button"
               aria-label="Sign out"
               title="Sign out"
-              onClick={onLogout}
+              onClick={() => setLogoutOpen(true)}
             >
               <LogOut size={16} />
             </button>
@@ -154,11 +216,24 @@ export function ProtectedLayout() {
           </button>
           <div className="topbar-title">{title}</div>
           <div className="topbar-actions">
-            <span className="api-indicator"><span /> API connected</span>
+            <span
+              className={`api-indicator ${
+                health.data?.status === "ok"
+                  ? "api-healthy"
+                  : health.isLoading
+                    ? "api-pending"
+                    : "api-error"
+              }`}
+              role="status"
+              aria-live="polite"
+            >
+              <span aria-hidden="true" />
+              {apiStatus}
+            </span>
             <Button
               variant="quiet"
               className="refresh-button"
-              onClick={() => void queryClient.invalidateQueries()}
+              onClick={refreshCurrentPage}
             >
               <RefreshCw size={15} />
               <span>Refresh</span>
@@ -168,6 +243,16 @@ export function ProtectedLayout() {
         </header>
         <main className="main-content"><Outlet /></main>
       </div>
+      <ConfirmationDialog
+        open={logoutOpen}
+        onOpenChange={setLogoutOpen}
+        title="Sign out of Orbit?"
+        description="Are you sure you want to sign out of your administrator account?"
+        confirmLabel="Sign out"
+        pendingLabel="Signing out…"
+        errorFallback="Unable to sign out. Please try again."
+        onConfirm={confirmLogout}
+      />
     </div>
   );
 }

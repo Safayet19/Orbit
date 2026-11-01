@@ -1,10 +1,10 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app.agents.orchestrator import CollectionOrchestrator, CollectionRunError
@@ -20,7 +20,7 @@ from backend.app.db.models import (
     RecordVersion,
     Source,
 )
-from backend.app.db.repositories import upsert_observation
+from backend.app.db.repositories import persist_success, upsert_observation
 from backend.app.pipeline.fingerprint import content_fingerprint
 from backend.app.schemas.records import (
     WORLD_BANK_SOURCE_ID,
@@ -145,6 +145,104 @@ def test_repository_deduplicates_and_appends_changed_versions() -> None:
         assert [version.version_number for version in versions] == [1, 2]
 
     engine.dispose()
+
+
+def test_persistence_batches_latest_version_lookups_for_changed_records() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    now = datetime.now(timezone.utc)
+    try:
+        with Session(engine) as session, session.begin():
+            source = Source(
+                source_key=WORLD_BANK_SOURCE_ID,
+                name="World Bank Bangladesh Inflation",
+                source_type="api",
+                official_url=WORLD_BANK_SOURCE_URL,
+                category="economic_indicators",
+                collection_config={},
+                licensing_metadata={},
+                enabled=True,
+            )
+            session.add(source)
+            session.flush()
+            run = CollectionRun(source_id=source.id, status="running")
+            session.add(run)
+            session.flush()
+
+            records = [
+                _validated_record("3.1", now).model_copy(
+                    update={
+                        "external_record_id": f"{WORLD_BANK_SOURCE_ID}:BGD:{year}",
+                        "year": year,
+                    }
+                )
+                for year in range(2020, 2023)
+            ]
+            current_records = [
+                CurrentRecord(
+                    source_id=source.id,
+                    external_record_id=record.external_record_id,
+                    category=source.category,
+                    data={},
+                    numeric_value=Decimal("2.5"),
+                    source_url=WORLD_BANK_SOURCE_URL,
+                    first_observed_at=now - timedelta(days=1),
+                    last_observed_at=now - timedelta(days=1),
+                    fingerprint="0" * 64,
+                    status="active",
+                )
+                for record in records
+            ]
+            session.add_all(current_records)
+            session.flush()
+            session.add_all(
+                [
+                    RecordVersion(
+                        record_id=current.id,
+                        version_number=1,
+                        data={},
+                        numeric_value=Decimal("2.5"),
+                        fingerprint="0" * 64,
+                        observed_at=now - timedelta(days=1),
+                        provenance={},
+                    )
+                    for current in current_records
+                ]
+            )
+            session.flush()
+
+            version_selects: list[str] = []
+
+            def capture(_conn, _cursor, statement, _params, _context, _many):
+                if (
+                    statement.lstrip().lower().startswith("select")
+                    and "orbit_record_versions" in statement.lower()
+                ):
+                    version_selects.append(statement.lower())
+
+            event.listen(engine, "before_cursor_execute", capture)
+            try:
+                counts = persist_success(
+                    session=session,
+                    run_id=run.id,
+                    source=source,
+                    records=records,
+                    invalid_records=[],
+                    records_fetched=len(records),
+                    completed_at=now,
+                )
+            finally:
+                event.remove(engine, "before_cursor_execute", capture)
+
+            assert counts == {"new": 0, "changed": 3, "unchanged": 0}
+            assert len(version_selects) == 1
+            assert "group by" in version_selects[0]
+            assert sorted(
+                version.version_number
+                for version in session.scalars(select(RecordVersion)).all()
+            ) == [1, 1, 1, 2, 2, 2]
+    finally:
+        engine.dispose()
 
 
 def test_world_bank_rejects_malformed_response() -> None:

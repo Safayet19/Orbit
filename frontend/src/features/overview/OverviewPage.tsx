@@ -1,10 +1,13 @@
-import { lazy, Suspense, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Activity, AlertTriangle, Boxes, CircleCheck, Database, Play, Timer, type LucideIcon } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../services/api";
 import { useOverview, useSources } from "../../services/queries";
 import { Button, EmptyState, ErrorState, formatDateTime, formatDuration, LoadingState, MetricCard, PageHeader, Panel, StatusBadge } from "../../components/ui/Primitives";
 import { useToast } from "../../components/ui/Toast";
+import { ConfirmationDialog } from "../../components/ui/ConfirmationDialog";
+import type { Source } from "../../types/api";
 
 const ActivityChart = lazy(() =>
   import("../../components/charts/ActivityChart").then((module) => ({
@@ -13,24 +16,37 @@ const ActivityChart = lazy(() =>
 );
 
 export default function OverviewPage() {
+  const mounted = useRef(false);
   const [period, setPeriod] = useState(30);
+  const [pendingSource, setPendingSource] = useState<Source | null>(null);
   const { data, isLoading, isError, error, refetch } = useOverview(period);
   const sources = useSources();
   const navigate = useNavigate();
   const notify = useToast();
+  const queryClient = useQueryClient();
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
-  async function runSource(sourceId: string) {
-    try {
-      await api("/api/admin/collections", {
+  const startCollection = useMutation({
+    mutationFn: (sourceId: string) =>
+      api<{ run_id: string }>("/api/admin/collections", {
         method: "POST",
         body: JSON.stringify({ source_id: sourceId }),
-      });
-      notify("success", "Collection run queued.");
-      navigate("/operations");
-    } catch (reason) {
-      notify("error", reason instanceof Error ? reason.message : "Could not start collection.");
-    }
-  }
+      }),
+    onSuccess: async (result) => {
+      notify("success", `Collection started · ${result.run_id}`);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["overview"] }),
+        queryClient.invalidateQueries({ queryKey: ["runs"] }),
+        queryClient.invalidateQueries({ queryKey: ["agent-status"] }),
+      ]);
+      if (mounted.current) navigate(`/operations?run=${result.run_id}`);
+    },
+  });
 
   if (isLoading) return <LoadingState />;
   if (isError || !data) {
@@ -90,8 +106,8 @@ export default function OverviewPage() {
               <Button
                 key={source.source_key}
                 variant="secondary"
-                disabled={data.running_runs > 0}
-                onClick={() => void runSource(source.source_key)}
+                disabled={data.running_runs > 0 || startCollection.isPending}
+                onClick={() => setPendingSource(source)}
               >
                 <Play size={14} /> Run {source.name}
               </Button>
@@ -147,6 +163,23 @@ export default function OverviewPage() {
           ) : <EmptyState title="No changes detected" description="Meaningful record updates will appear after a source returns changed values." />}
         </Panel>
       </div>
+      <ConfirmationDialog
+        open={pendingSource !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingSource(null);
+        }}
+        title="Start data collection?"
+        description={`Start a new collection for ${pendingSource?.name ?? "this source"}? Orbit will retrieve source data, validate it, and update stored records when changes are detected.`}
+        confirmLabel="Start collection"
+        pendingLabel="Starting…"
+        errorFallback="Collection could not be started. Please try again."
+        onConfirm={async () => {
+          if (!pendingSource?.enabled || !pendingSource.supported) {
+            throw new Error("This source is not enabled for approved collection.");
+          }
+          await startCollection.mutateAsync(pendingSource.source_key);
+        }}
+      />
     </>
   );
 }

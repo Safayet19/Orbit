@@ -5,6 +5,7 @@ from typing import Any
 from sqlalchemy import String, cast, case, func, or_, select
 from sqlalchemy.orm import aliased
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from backend.app.api.schemas import (
     InvalidRecordSummary,
@@ -28,7 +29,13 @@ SUPPORTED_SOURCE_IDS = frozenset(spec.source_id for spec in INDICATOR_SPECS)
 
 def _run_summary(run: CollectionRun, source_name: str, now: datetime) -> RunSummary:
     end = run.completed_at or now
-    duration = max(0.0, (end - run.started_at).total_seconds())
+    normalized_end = end.replace(tzinfo=timezone.utc) if end.tzinfo is None else end
+    normalized_start = (
+        run.started_at.replace(tzinfo=timezone.utc)
+        if run.started_at.tzinfo is None
+        else run.started_at
+    )
+    duration = max(0.0, (normalized_end - normalized_start).total_seconds())
     return RunSummary(
         id=str(run.id),
         source_id=str(run.source_id),
@@ -95,18 +102,21 @@ def list_sources(session: Session) -> list[SourceSummary]:
         .correlate(Source)
         .scalar_subquery()
     )
+    record_counts = (
+        select(CurrentRecord.source_id, func.count(CurrentRecord.id).label("record_count"))
+        .group_by(CurrentRecord.source_id)
+        .subquery()
+    )
     latest_run_rows = session.execute(
-        select(Source, CollectionRun)
+        select(
+            Source,
+            CollectionRun,
+            func.coalesce(record_counts.c.record_count, 0),
+        )
         .outerjoin(CollectionRun, CollectionRun.id == latest_run_id)
+        .outerjoin(record_counts, record_counts.c.source_id == Source.id)
         .order_by(Source.name)
     ).all()
-    record_counts = dict(
-        session.execute(
-            select(CurrentRecord.source_id, func.count(CurrentRecord.id)).group_by(
-                CurrentRecord.source_id
-            )
-        ).all()
-    )
     return [
         SourceSummary(
             id=str(source.id),
@@ -118,11 +128,11 @@ def list_sources(session: Session) -> list[SourceSummary]:
             enabled=source.enabled,
             last_collection_at=run.completed_at or run.started_at if run else None,
             last_result=run.status if run else None,
-            latest_record_count=int(record_counts.get(source.id, 0)),
+            latest_record_count=int(record_count),
             latest_error=run.error_summary if run else None,
             supported=source.source_key in SUPPORTED_SOURCE_IDS,
         )
-        for source, run in latest_run_rows
+        for source, run, record_count in latest_run_rows
     ]
 
 
@@ -164,45 +174,61 @@ def get_overview(session: Session, period_days: int) -> OverviewResponse:
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=period_days)
     total_records = int(session.scalar(select(func.count(CurrentRecord.id))) or 0)
-    registered_sources = int(session.scalar(select(func.count(Source.id))) or 0)
-    successful_runs = int(
-        session.scalar(
-            select(func.count(CollectionRun.id)).where(
-                CollectionRun.status == "completed"
-            )
-        )
-        or 0
-    )
-    failed_runs = int(
-        session.scalar(
-            select(func.count(CollectionRun.id)).where(CollectionRun.status == "failed")
-        )
-        or 0
-    )
-    running_runs = int(
-        session.scalar(
-            select(func.count(CollectionRun.id)).where(CollectionRun.status == "running")
-        )
-        or 0
-    )
-    enabled_sources = int(
-        session.scalar(select(func.count(Source.id)).where(Source.enabled.is_(True))) or 0
-    )
     stale_before = now - timedelta(days=7)
-    stale_sources_query = (
-        select(func.count(Source.id))
-        .where(Source.enabled.is_(True))
+    recent_completed_run = (
+        select(CollectionRun.id)
         .where(
-            ~select(CollectionRun.id)
-            .where(CollectionRun.source_id == Source.id)
-            .where(CollectionRun.status == "completed")
-            .where(CollectionRun.completed_at >= stale_before)
-            .exists()
+            CollectionRun.source_id == Source.id,
+            CollectionRun.status == "completed",
+            CollectionRun.completed_at >= stale_before,
         )
+        .exists()
     )
-    stale_sources = int(session.scalar(stale_sources_query) or 0)
+    source_counts = session.execute(
+        select(
+            func.count(Source.id),
+            func.coalesce(
+                func.sum(case((Source.enabled.is_(True), 1), else_=0)),
+                0,
+            ),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            Source.enabled.is_(True) & ~recent_completed_run,
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ),
+        )
+    ).one()
+    registered_sources, enabled_sources, stale_sources = map(int, source_counts)
+    run_counts = session.execute(
+        select(
+            func.coalesce(
+                func.sum(case((CollectionRun.status == "completed", 1), else_=0)),
+                0,
+            ),
+            func.coalesce(
+                func.sum(case((CollectionRun.status == "failed", 1), else_=0)),
+                0,
+            ),
+            func.coalesce(
+                func.sum(case((CollectionRun.status == "running", 1), else_=0)),
+                0,
+            ),
+        )
+    ).one()
+    successful_runs, failed_runs, running_runs = map(int, run_counts)
 
-    day_expression = func.date_trunc("day", CollectionRun.started_at)
+    day_expression = (
+        func.date_trunc("day", CollectionRun.started_at)
+        if session.get_bind().dialect.name == "postgresql"
+        else func.date(CollectionRun.started_at)
+    )
     trend_rows = session.execute(
         select(
             day_expression.label("day"),
@@ -216,7 +242,7 @@ def get_overview(session: Session, period_days: int) -> OverviewResponse:
     ).all()
     chart = [
         {
-            "date": day.isoformat(),
+            "date": day.isoformat() if isinstance(day, datetime) else str(day),
             "new_records": int(new_records),
             "changed_records": int(changed_records),
             "failed_runs": int(failures),
@@ -276,31 +302,14 @@ def get_overview(session: Session, period_days: int) -> OverviewResponse:
     )
 
 
-def list_records(
-    session: Session,
-    page: int,
-    page_size: int,
+def record_filter_expressions(
     search: str | None = None,
     source_key: str | None = None,
     category: str | None = None,
     observed_after: datetime | None = None,
     observed_before: datetime | None = None,
-    sort_by: str = "last_observed_at",
-    sort_order: str = "desc",
-) -> tuple[list[RecordSummary], int]:
-    allowed_sort = {
-        "last_observed_at": CurrentRecord.last_observed_at,
-        "first_observed_at": CurrentRecord.first_observed_at,
-        "category": CurrentRecord.category,
-        "external_record_id": CurrentRecord.external_record_id,
-    }
-    query = select(CurrentRecord, Source.name).join(
-        Source, CurrentRecord.source_id == Source.id
-    )
-    count_query = select(func.count(CurrentRecord.id)).join(
-        Source, CurrentRecord.source_id == Source.id
-    )
-    filters = []
+) -> list[ColumnElement[bool]]:
+    filters: list[ColumnElement[bool]] = []
     if search:
         term = f"%{search.strip()[:120]}%"
         filters.append(
@@ -319,13 +328,42 @@ def list_records(
         filters.append(CurrentRecord.last_observed_at >= observed_after)
     if observed_before:
         filters.append(CurrentRecord.last_observed_at <= observed_before)
-    for criterion in filters:
-        query = query.where(criterion)
-        count_query = count_query.where(criterion)
+    return filters
+
+
+def list_records(
+    session: Session,
+    page: int,
+    page_size: int,
+    search: str | None = None,
+    source_key: str | None = None,
+    category: str | None = None,
+    observed_after: datetime | None = None,
+    observed_before: datetime | None = None,
+    sort_by: str = "last_observed_at",
+    sort_order: str = "desc",
+) -> tuple[list[RecordSummary], int]:
+    allowed_sort = {
+        "last_observed_at": CurrentRecord.last_observed_at,
+        "first_observed_at": CurrentRecord.first_observed_at,
+        "category": CurrentRecord.category,
+        "external_record_id": CurrentRecord.external_record_id,
+    }
+    count_query = select(func.count(CurrentRecord.id)).join(
+        Source, CurrentRecord.source_id == Source.id
+    )
+    filters = record_filter_expressions(
+        search,
+        source_key,
+        category,
+        observed_after,
+        observed_before,
+    )
+    count_query = count_query.where(*filters)
 
     total = int(session.scalar(count_query) or 0)
     column = allowed_sort[sort_by]
-    query = query.order_by(column.desc() if sort_order == "desc" else column.asc())
+    sort_column = column.desc() if sort_order == "desc" else column.asc()
     latest_version_number = (
         select(func.max(RecordVersion.version_number))
         .where(RecordVersion.record_id == CurrentRecord.id)
@@ -336,7 +374,7 @@ def list_records(
         select(CurrentRecord, Source.name, latest_version_number)
         .join(Source, CurrentRecord.source_id == Source.id)
         .where(*filters)
-        .order_by(column.desc() if sort_order == "desc" else column.asc())
+        .order_by(sort_column, CurrentRecord.id)
         .offset((page - 1) * page_size)
         .limit(page_size)
     ).all()
@@ -361,19 +399,20 @@ def list_records(
 
 
 def get_record(session: Session, record_id: uuid.UUID) -> RecordSummary | None:
+    latest_version_number = (
+        select(func.max(RecordVersion.version_number))
+        .where(RecordVersion.record_id == CurrentRecord.id)
+        .correlate(CurrentRecord)
+        .scalar_subquery()
+    )
     row = session.execute(
-        select(CurrentRecord, Source.name)
+        select(CurrentRecord, Source.name, latest_version_number)
         .join(Source, CurrentRecord.source_id == Source.id)
         .where(CurrentRecord.id == record_id)
     ).first()
     if row is None:
         return None
-    record, source_name = row
-    latest_version = session.scalar(
-        select(func.max(RecordVersion.version_number)).where(
-            RecordVersion.record_id == record.id
-        )
-    )
+    record, source_name, latest_version = row
     return RecordSummary(
         id=str(record.id),
         source_id=str(record.source_id),
@@ -449,19 +488,23 @@ def list_history(
         query = query.where(Source.source_key == source_key)
         count_query = count_query.where(Source.source_key == source_key)
     total = int(session.scalar(count_query) or 0)
+    previous_version = aliased(RecordVersion)
     rows = session.execute(
-        query.order_by(RecordVersion.observed_at.desc())
+        query.add_columns(previous_version.data)
+        .outerjoin(
+            previous_version,
+            (previous_version.record_id == RecordVersion.record_id)
+            & (
+                previous_version.version_number
+                == RecordVersion.version_number - 1
+            ),
+        )
+        .order_by(RecordVersion.observed_at.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     ).all()
     result: list[dict[str, Any]] = []
-    for version, record, source_name, source_key_value in rows:
-        previous = session.scalar(
-            select(RecordVersion.data).where(
-                RecordVersion.record_id == record.id,
-                RecordVersion.version_number == version.version_number - 1,
-            )
-        )
+    for version, record, source_name, source_key_value, previous in rows:
         result.append(
             {
                 "version_id": str(version.id),

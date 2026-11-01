@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -24,6 +25,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthenticatedUser | null>(null);
   const [loading, setLoading] = useState(true);
   const [setupError, setSetupError] = useState<string | null>(null);
+  const authRequestId = useRef(0);
+  const logoutRequest = useRef<Promise<void> | null>(null);
 
   const applyUser = useCallback((value: AuthenticatedUser | null) => {
     setUser(value);
@@ -32,31 +35,36 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let active = true;
-    api<AuthenticatedUser>("/api/auth/session")
+    const requestId = ++authRequestId.current;
+    const controller = new AbortController();
+    api<AuthenticatedUser>("/api/auth/session", { signal: controller.signal })
       .then((value) => {
-        if (active) applyUser(value);
+        if (active && requestId === authRequestId.current) applyUser(value);
       })
       .catch((error: unknown) => {
-        if (!active) return;
+        if (!active || requestId !== authRequestId.current) return;
         if (error instanceof ApiError && error.status === 503) {
           setSetupError(error.message);
         }
         applyUser(null);
       })
       .finally(() => {
-        if (active) setLoading(false);
+        if (active && requestId === authRequestId.current) setLoading(false);
       });
     return () => {
       active = false;
+      controller.abort();
     };
   }, [applyUser]);
 
   const login = useCallback(
     async (username: string, password: string) => {
+      const requestId = ++authRequestId.current;
       const value = await api<AuthenticatedUser>("/api/auth/login", {
         method: "POST",
         body: JSON.stringify({ username, password }),
       });
+      if (requestId !== authRequestId.current) return;
       setSetupError(null);
       applyUser(value);
     },
@@ -64,8 +72,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 
   const logout = useCallback(async () => {
-    await api<void>("/api/auth/logout", { method: "POST" });
-    applyUser(null);
+    if (logoutRequest.current) return logoutRequest.current;
+    const requestId = ++authRequestId.current;
+    const request = api<void>("/api/auth/logout", { method: "POST" })
+      .then(() => {
+        if (requestId === authRequestId.current) applyUser(null);
+      })
+      .catch((error: unknown) => {
+        if (
+          error instanceof ApiError &&
+          error.status === 401 &&
+          requestId === authRequestId.current
+        ) {
+          applyUser(null);
+        }
+        throw error;
+      });
+    logoutRequest.current = request;
+    try {
+      await request;
+    } finally {
+      if (logoutRequest.current === request) logoutRequest.current = null;
+    }
   }, [applyUser]);
 
   const value = useMemo(

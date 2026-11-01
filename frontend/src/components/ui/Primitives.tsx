@@ -6,22 +6,25 @@ import {
   LoaderCircle,
   type LucideIcon,
 } from "lucide-react";
-import type { ReactNode } from "react";
+import { forwardRef, type ReactNode } from "react";
 
-export function Button({
-  children,
-  variant = "primary",
-  className = "",
-  ...props
-}: React.ButtonHTMLAttributes<HTMLButtonElement> & {
-  variant?: "primary" | "secondary" | "quiet" | "danger";
-}) {
+const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
+  dateStyle: "medium",
+  timeStyle: "short",
+});
+
+export const Button = forwardRef<
+  HTMLButtonElement,
+  React.ButtonHTMLAttributes<HTMLButtonElement> & {
+    variant?: "primary" | "secondary" | "quiet" | "danger";
+  }
+>(function Button({ children, variant = "primary", className = "", ...props }, ref) {
   return (
-    <button className={`button button-${variant} ${className}`} {...props}>
+    <button ref={ref} className={`button button-${variant} ${className}`} {...props}>
       {children}
     </button>
   );
-}
+});
 
 export function Panel({
   title,
@@ -209,10 +212,7 @@ export function formatDateTime(value: string | null | undefined): string {
   if (!value) return "—";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "—";
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(date);
+  return dateTimeFormatter.format(date);
 }
 
 export function formatDuration(seconds: number | null): string {

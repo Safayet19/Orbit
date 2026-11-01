@@ -1,4 +1,13 @@
-import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { AlertCircle, CheckCircle2, X } from "lucide-react";
 
 type ToastTone = "success" | "error";
@@ -14,14 +23,32 @@ const ToastContext = createContext<(tone: ToastTone, message: string) => void>(
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [messages, setMessages] = useState<ToastMessage[]>([]);
+  const nextId = useRef(0);
+  const timers = useRef(new Map<number, number>());
+  useEffect(
+    () => () => {
+      timers.current.forEach((timer) => window.clearTimeout(timer));
+      timers.current.clear();
+    },
+    [],
+  );
   const notify = useCallback((tone: ToastTone, message: string) => {
-    const id = Date.now() + Math.random();
-    setMessages((current) => [...current, { id, tone, message }]);
-    window.setTimeout(
-      () => setMessages((current) => current.filter((item) => item.id !== id)),
-      5000,
+    const id = ++nextId.current;
+    setMessages((current) => [...current.slice(-2), { id, tone, message }]);
+    timers.current.set(
+      id,
+      window.setTimeout(() => {
+        setMessages((current) => current.filter((item) => item.id !== id));
+        timers.current.delete(id);
+      }, 5000),
     );
   }, []);
+  const dismiss = (id: number) => {
+    const timer = timers.current.get(id);
+    if (timer !== undefined) window.clearTimeout(timer);
+    timers.current.delete(id);
+    setMessages((current) => current.filter((item) => item.id !== id));
+  };
   const value = useMemo(() => notify, [notify]);
   return (
     <ToastContext.Provider value={value}>
@@ -30,17 +57,17 @@ export function ToastProvider({ children }: { children: ReactNode }) {
         {messages.map((item) => {
           const Icon = item.tone === "success" ? CheckCircle2 : AlertCircle;
           return (
-            <div className={`toast toast-${item.tone}`} key={item.id} role="status">
+            <div
+              className={`toast toast-${item.tone}`}
+              key={item.id}
+              role={item.tone === "error" ? "alert" : "status"}
+            >
               <Icon size={17} />
               <span>{item.message}</span>
               <button
                 type="button"
                 aria-label="Dismiss notification"
-                onClick={() =>
-                  setMessages((current) =>
-                    current.filter((entry) => entry.id !== item.id),
-                  )
-                }
+                onClick={() => dismiss(item.id)}
               >
                 <X size={15} />
               </button>

@@ -2,12 +2,14 @@ import csv
 import io
 import json
 import uuid
+from collections.abc import Iterator
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypedDict
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app.api.auth import get_admin_session
 from backend.app.api.dependencies import get_session
@@ -17,8 +19,9 @@ from backend.app.api.services.admin_reads import (
     list_history,
     list_records,
     list_versions,
+    record_filter_expressions,
 )
-from backend.app.db.models import AdminSession
+from backend.app.db.models import AdminSession, CurrentRecord, Source
 
 router = APIRouter(
     prefix="/records",
@@ -26,6 +29,16 @@ router = APIRouter(
     dependencies=[Depends(get_admin_session)],
 )
 MAX_EXPORT_ROWS = 5000
+EXPORT_BATCH_SIZE = 250
+EXPORT_CHUNK_ROWS = 64
+
+
+class RecordFilters(TypedDict):
+    search: str | None
+    source_key: str | None
+    category: str | None
+    observed_after: datetime | None
+    observed_before: datetime | None
 
 
 def _record_filters(
@@ -34,7 +47,7 @@ def _record_filters(
     category: str | None,
     observed_after: datetime | None,
     observed_before: datetime | None,
-) -> dict[str, object]:
+) -> RecordFilters:
     if observed_after and observed_before and observed_after > observed_before:
         raise HTTPException(
             status_code=422,
@@ -103,66 +116,112 @@ def export_records(
     filters = _record_filters(
         search, source_id, category, observed_after, observed_before
     )
-    items, total = list_records(
-        session,
-        1,
-        min(MAX_EXPORT_ROWS, 100),
-        **filters,
-    )
-    if total > MAX_EXPORT_ROWS:
+    conditions = record_filter_expressions(**filters)
+    record_ids = session.scalars(
+        select(CurrentRecord.id)
+        .join(Source, CurrentRecord.source_id == Source.id)
+        .where(*conditions)
+        .order_by(CurrentRecord.last_observed_at.desc(), CurrentRecord.id)
+        .limit(MAX_EXPORT_ROWS + 1)
+    ).all()
+    if len(record_ids) > MAX_EXPORT_ROWS:
         raise HTTPException(
             status_code=413,
             detail=f"Export is limited to {MAX_EXPORT_ROWS} records; narrow the filters.",
         )
-    while len(items) < total:
-        next_page, _ = list_records(
-            session,
-            len(items) // 100 + 1,
-            100,
-            **filters,
-        )
-        if not next_page:
-            break
-        items.extend(next_page)
 
-    field_names = sorted(
-        {
-            key
-            for record in items
-            for key in record.data
+    field_names: set[str] = set()
+    prefetched_records: list[tuple[CurrentRecord, str]] | None = None
+    if len(record_ids) <= EXPORT_BATCH_SIZE and record_ids:
+        rows = session.execute(
+            select(CurrentRecord, Source.name)
+            .join(Source, CurrentRecord.source_id == Source.id)
+            .where(CurrentRecord.id.in_(record_ids))
+        ).all()
+        records_by_id = {
+            record.id: (record, source_name)
+            for record, source_name in rows
         }
-    )
-    buffer = io.StringIO(newline="")
-    writer = csv.writer(buffer)
-    writer.writerow(
-        _safe_csv_value(value)
-        for value in [
-            "record_id",
-            "source_name",
-            "external_record_id",
-            "category",
-            "source_url",
-            "first_observed_at",
-            "last_observed_at",
-            *field_names,
-        ]
-    )
-    for record in items:
-        values = [
-            record.id,
-            record.source_name,
-            record.external_record_id,
-            record.category,
-            record.source_url,
-            record.first_observed_at.isoformat(),
-            record.last_observed_at.isoformat(),
-        ]
-        values.extend(record.data.get(field) for field in field_names)
-        writer.writerow(_safe_csv_value(value) for value in values)
+        prefetched_records = [records_by_id[record_id] for record_id in record_ids]
+        for record, _source_name in prefetched_records:
+            field_names.update(record.data)
+    else:
+        for offset in range(0, len(record_ids), EXPORT_BATCH_SIZE):
+            batch_ids = record_ids[offset : offset + EXPORT_BATCH_SIZE]
+            data_rows = session.scalars(
+                select(CurrentRecord.data).where(CurrentRecord.id.in_(batch_ids))
+            ).all()
+            for data in data_rows:
+                field_names.update(data)
+    ordered_fields = sorted(field_names)
+    export_sessions = sessionmaker(bind=session.get_bind(), expire_on_commit=False)
+    session.close()
 
-    buffer.seek(0)
+    def generate_csv() -> Iterator[str]:
+        with export_sessions() as export_session:
+            buffer = io.StringIO(newline="")
+            writer = csv.writer(buffer)
+            pending_rows = 0
+            writer.writerow(
+                _safe_csv_value(value)
+                for value in [
+                    "record_id",
+                    "source_name",
+                    "external_record_id",
+                    "category",
+                    "source_url",
+                    "first_observed_at",
+                    "last_observed_at",
+                    *ordered_fields,
+                ]
+            )
+            yield buffer.getvalue()
+            buffer.seek(0)
+            buffer.truncate(0)
+
+            for offset in range(0, len(record_ids), EXPORT_BATCH_SIZE):
+                batch_ids = record_ids[offset : offset + EXPORT_BATCH_SIZE]
+                if prefetched_records is not None:
+                    rows = prefetched_records[offset : offset + len(batch_ids)]
+                    batch_records = dict(
+                        zip(batch_ids, rows, strict=True)
+                    )
+                else:
+                    rows = export_session.execute(
+                        select(CurrentRecord, Source.name)
+                        .join(Source, CurrentRecord.source_id == Source.id)
+                        .where(CurrentRecord.id.in_(batch_ids))
+                    ).all()
+                    batch_records = {
+                        record.id: (record, source_name)
+                        for record, source_name in rows
+                    }
+                for record_id in batch_ids:
+                    record, source_name = batch_records[record_id]
+                    values = [
+                        record.id,
+                        source_name,
+                        record.external_record_id,
+                        record.category,
+                        record.source_url,
+                        record.first_observed_at.isoformat(),
+                        record.last_observed_at.isoformat(),
+                    ]
+                    values.extend(
+                        record.data.get(field) for field in ordered_fields
+                    )
+                    writer.writerow(_safe_csv_value(value) for value in values)
+                    pending_rows += 1
+                    if pending_rows == EXPORT_CHUNK_ROWS:
+                        yield buffer.getvalue()
+                        buffer.seek(0)
+                        buffer.truncate(0)
+                        pending_rows = 0
+            if buffer.tell():
+                yield buffer.getvalue()
+
     return StreamingResponse(
-        iter([buffer.getvalue()]),
+        generate_csv(),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="orbit-records.csv"'},
     )

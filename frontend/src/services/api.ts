@@ -1,4 +1,6 @@
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+const unsafeErrorDetail =
+  /\b(?:sql|postgres(?:ql)?|database|password|credentials?|traceback|stack trace)\b|:\/\/[^/\s:@]+:[^/\s@]+@/i;
 let csrfToken: string | null = null;
 
 export function setCsrfToken(value: string | null): void {
@@ -13,6 +15,12 @@ export class ApiError extends Error {
     super(message);
     this.name = "ApiError";
   }
+}
+
+export function userFacingError(error: unknown, fallback: string): string {
+  if (!(error instanceof ApiError) || error.status >= 500) return fallback;
+  if (unsafeErrorDetail.test(error.message)) return fallback;
+  return error.message;
 }
 
 export async function api<T>(
@@ -40,7 +48,12 @@ export async function api<T>(
     let message = `Request failed (${response.status}).`;
     try {
       const body = (await response.json()) as { detail?: unknown };
-      if (typeof body.detail === "string") message = body.detail;
+      if (
+        typeof body.detail === "string" &&
+        !unsafeErrorDetail.test(body.detail)
+      ) {
+        message = body.detail;
+      }
     } catch {
       // Retain the safe status-based message for non-JSON responses.
     }
